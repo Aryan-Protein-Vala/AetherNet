@@ -17,6 +17,7 @@ import (
 
 	"github.com/Aryan-Protein-Vala/AetherNet/pkg/chunker"
 	"github.com/Aryan-Protein-Vala/AetherNet/pkg/network"
+	"github.com/Aryan-Protein-Vala/AetherNet/pkg/receiver"
 )
 
 const version = "0.1.0-alpha"
@@ -51,16 +52,28 @@ func main() {
 		},
 	})
 
-	// ── aether send <filepath> ───────────────────────────────────────
+	// ── aether send <filepath> --to <url> ────────────────────────────
 	sendCmd := &cobra.Command{
 		Use:   "send [filepath]",
-		Short: "Chunk and upload a file via parallel streams",
+		Short: "Chunk and upload a file to an Aether receiver",
+		Long:  "  Split a file into chunks and upload via parallel HTTP streams.\n\n  Example:\n    aether send model.bin --to http://localhost:8080",
 		Args:  cobra.ExactArgs(1),
 		RunE:  runSend,
 	}
+	sendCmd.Flags().StringP("to", "t", "http://localhost:8080", "Target receiver URL")
 	sendCmd.Flags().Uint32P("chunk-size", "c", 0, "Chunk size in bytes (default: 2MB)")
 	sendCmd.Flags().IntP("workers", "w", 5, "Number of parallel upload workers")
 	root.AddCommand(sendCmd)
+
+	// ── aether receive --port <port> ─────────────────────────────────
+	receiveCmd := &cobra.Command{
+		Use:   "receive",
+		Short: "Start the Aether chunk receiver server",
+		Long:  "  Start an HTTP server that accepts incoming chunk uploads.\n\n  Example:\n    aether receive --port 8080",
+		RunE:  runReceive,
+	}
+	receiveCmd.Flags().IntP("port", "p", 8080, "Port to listen on")
+	root.AddCommand(receiveCmd)
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
@@ -73,6 +86,7 @@ func main() {
 
 func runSend(cmd *cobra.Command, args []string) error {
 	filePath := args[0]
+	targetURL, _ := cmd.Flags().GetString("to")
 	chunkSizeFlag, _ := cmd.Flags().GetUint32("chunk-size")
 	workers, _ := cmd.Flags().GetInt("workers")
 
@@ -93,6 +107,7 @@ func runSend(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	printKV("File", filepath.Base(absPath))
 	printKV("Size", formatBytes(info.Size()))
+	printKV("Target", targetURL)
 	printKV("Workers", fmt.Sprintf("%d goroutines", workers))
 	fmt.Println()
 
@@ -123,7 +138,7 @@ func runSend(cmd *cobra.Command, args []string) error {
 	printStep(2, "Uploading chunks")
 	uploadStart := time.Now()
 
-	stats, err := network.Upload(manifest, ".aether_cache", workers)
+	stats, err := network.Upload(manifest, ".aether_cache", targetURL, workers)
 	if err != nil {
 		printError("Upload failed: %v", err)
 		return err
@@ -146,8 +161,11 @@ func runSend(cmd *cobra.Command, args []string) error {
 			yellow("⚠"), stats.FailCount)
 	}
 
-	// Metrics table
-	mbPerSec := float64(stats.TotalBytes) / (1024 * 1024) / uploadDur.Seconds()
+	// Metrics
+	mbPerSec := 0.0
+	if uploadDur.Seconds() > 0 {
+		mbPerSec = float64(stats.TotalBytes) / (1024 * 1024) / uploadDur.Seconds()
+	}
 
 	printKV("Chunks", fmt.Sprintf("%d/%d %s",
 		stats.SuccessCount, stats.TotalChunks, dim("verified")))
@@ -159,10 +177,21 @@ func runSend(cmd *cobra.Command, args []string) error {
 		magenta(fmt.Sprintf("%.2f MB/s", mbPerSec)), dim("(avg)")))
 
 	fmt.Println()
-	printKV("Destination", dim(network.MockServerDir))
+	printKV("Destination", dim(targetURL))
 	fmt.Println()
 
 	return nil
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// receive command
+// ──────────────────────────────────────────────────────────────────────
+
+func runReceive(cmd *cobra.Command, args []string) error {
+	port, _ := cmd.Flags().GetInt("port")
+
+	srv := receiver.New(port)
+	return srv.Start()
 }
 
 // ──────────────────────────────────────────────────────────────────────
