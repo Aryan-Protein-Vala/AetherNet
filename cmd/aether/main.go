@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/yourusername/aether/pkg/chunker"
+	"github.com/Aryan-Protein-Vala/AetherNet/pkg/chunker"
 )
 
 const version = "0.1.0-alpha"
