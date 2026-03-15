@@ -1,6 +1,7 @@
 # Binaries
 /bin/
 /aether
+.aether_cache/
 *.exe
 *.exe~
 *.dll
