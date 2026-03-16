@@ -243,33 +243,59 @@ func Upload(manifest *chunker.FileManifest, cacheDir string, targetURL string, n
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Worker logic
+// Worker logic — with retry + exponential backoff
 // ──────────────────────────────────────────────────────────────────────
 
+const (
+	maxRetries     = 3
+	baseBackoff    = 100 * time.Millisecond
+)
+
+// processUpload attempts to upload a chunk with retry and exponential backoff.
+// Each retry re-opens the file to reset the io.Reader position.
 func processUpload(job UploadJob, uploadURL string) UploadResult {
 	start := time.Now()
 	result := UploadResult{ChunkID: job.Chunk.ID}
 
+	var lastErr error
+	backoff := baseBackoff
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(backoff)
+			backoff *= 2 // exponential: 100ms -> 200ms -> 400ms
+		}
+
+		lastErr = doUpload(job, uploadURL, &result)
+		if lastErr == nil {
+			result.Success = true
+			result.Duration = time.Since(start)
+			return result
+		}
+	}
+
+	result.Err = fmt.Errorf("chunk %d failed after %d retries: %w",
+		job.Chunk.ID, maxRetries, lastErr)
+	result.Duration = time.Since(start)
+	return result
+}
+
+// doUpload performs a single upload attempt. Returns nil on success.
+func doUpload(job UploadJob, uploadURL string, result *UploadResult) error {
 	f, err := os.Open(job.ChunkPath)
 	if err != nil {
-		result.Err = fmt.Errorf("open chunk %d: %w", job.Chunk.ID, err)
-		result.Duration = time.Since(start)
-		return result
+		return fmt.Errorf("open: %w", err)
 	}
 	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
-		result.Err = fmt.Errorf("stat chunk %d: %w", job.Chunk.ID, err)
-		result.Duration = time.Since(start)
-		return result
+		return fmt.Errorf("stat: %w", err)
 	}
 
 	req, err := http.NewRequest(http.MethodPost, uploadURL, f)
 	if err != nil {
-		result.Err = fmt.Errorf("create request for chunk %d: %w", job.Chunk.ID, err)
-		result.Duration = time.Since(start)
-		return result
+		return fmt.Errorf("request: %w", err)
 	}
 
 	req.ContentLength = info.Size()
@@ -280,21 +306,15 @@ func processUpload(job UploadJob, uploadURL string) UploadResult {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		result.Err = fmt.Errorf("upload chunk %d: %w", job.Chunk.ID, err)
-		result.Duration = time.Since(start)
-		return result
+		return fmt.Errorf("http: %w", err)
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		result.Err = fmt.Errorf("chunk %d rejected: HTTP %d", job.Chunk.ID, resp.StatusCode)
-		result.Duration = time.Since(start)
-		return result
+		return fmt.Errorf("rejected: HTTP %d", resp.StatusCode)
 	}
 
-	result.Success = true
 	result.BytesSent = uint32(info.Size())
-	result.Duration = time.Since(start)
-	return result
+	return nil
 }

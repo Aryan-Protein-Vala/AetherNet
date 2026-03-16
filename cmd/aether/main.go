@@ -6,6 +6,7 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -126,6 +127,29 @@ func runSend(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		printError("Transfer failed: %v", err)
 		return err
+	}
+
+	// ── Send manifest + trigger reassembly ───────────────────────────
+	if stats.FailCount == 0 {
+		normalizedURL := strings.TrimRight(targetURL, "/")
+
+		// Send manifest so receiver knows the original filename
+		manifestJSON := fmt.Sprintf(
+			`{"file_name":"%s","file_size":%d,"total_chunks":%d,"chunk_size":%d}`,
+			pipe.FileName, pipe.FileSize, pipe.TotalChunks, pipe.ChunkSize,
+		)
+		req, _ := http.NewRequest(http.MethodPost,
+			normalizedURL+"/manifest",
+			strings.NewReader(manifestJSON),
+		)
+		req.Header.Set("X-Aether-File-ID", pipe.FileIDHex)
+		req.Header.Set("Content-Type", "application/json")
+		http.DefaultClient.Do(req)
+
+		// Trigger reassembly
+		req2, _ := http.NewRequest(http.MethodPost, normalizedURL+"/reassemble", nil)
+		req2.Header.Set("X-Aether-File-ID", pipe.FileIDHex)
+		http.DefaultClient.Do(req2)
 	}
 
 	totalDur := time.Since(totalStart)

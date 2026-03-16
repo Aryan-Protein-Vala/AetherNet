@@ -48,6 +48,8 @@ func New(port int) *Server {
 	s := &Server{Port: port}
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("/upload", s.handleUpload)
+	s.mux.HandleFunc("/manifest", s.handleManifest)
+	s.mux.HandleFunc("/reassemble", s.handleReassemble)
 	s.mux.HandleFunc("/health", s.handleHealth)
 	return s
 }
@@ -129,6 +131,78 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"status":"ok","chunk_id":%d,"bytes":%d}`, chunkID, bytesWritten)
+}
+
+// handleManifest stores file manifest metadata for later reassembly.
+// POST /manifest with X-Aether-File-ID header, JSON body.
+func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	fileID := r.Header.Get("X-Aether-File-ID")
+	if fileID == "" {
+		http.Error(w, `{"error":"missing X-Aether-File-ID"}`, http.StatusBadRequest)
+		return
+	}
+
+	destDir := filepath.Join(receivedDir, fileID)
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"mkdir: %s"}`, err), http.StatusInternalServerError)
+		return
+	}
+
+	manifestPath := filepath.Join(destDir, "manifest.json")
+	f, err := os.Create(manifestPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"create manifest: %s"}`, err), http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+
+	n, err := io.Copy(f, r.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"write manifest: %s"}`, err), http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Printf("  %s manifest saved for %s (%d bytes)\n", green("✓"), dim(fileID[:12]+"…"), n)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"status":"ok","bytes":%d}`, n)
+}
+
+// handleReassemble reconstructs the original file from received chunks.
+// POST /reassemble with JSON body: {"file_id":"...", "output_dir":"..."}
+func (s *Server) handleReassemble(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	fileID := r.Header.Get("X-Aether-File-ID")
+	outputDir := r.Header.Get("X-Aether-Output-Dir")
+	if fileID == "" {
+		http.Error(w, `{"error":"missing X-Aether-File-ID"}`, http.StatusBadRequest)
+		return
+	}
+	if outputDir == "" {
+		outputDir = "."
+	}
+
+	outPath, err := Reassemble(fileID, outputDir)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"reassemble: %s"}`, err), http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Printf("  %s file reassembled: %s\n", green("✓"), bold(outPath))
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"status":"ok","path":"%s"}`, outPath)
 }
 
 // streamToDisk writes from reader to path while computing BLAKE3-256.
