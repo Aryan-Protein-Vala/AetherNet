@@ -1,11 +1,10 @@
 // Aether CLI — High-performance file transfer tool.
 //
-// Built with spf13/cobra. Terminal output inspired by Vercel/Stripe CLIs:
-// clean spacing, colored status indicators, and precise metrics.
+// Built with spf13/cobra. Uses pipelined architecture: chunking and
+// uploading happen concurrently for maximum throughput.
 package main
 
 import (
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,9 +19,8 @@ import (
 	"github.com/Aryan-Protein-Vala/AetherNet/pkg/receiver"
 )
 
-const version = "0.1.0-alpha"
+const version = "0.2.0-alpha"
 
-// ── Color presets ────────────────────────────────────────────────────
 var (
 	cyan    = color.New(color.FgCyan, color.Bold).SprintFunc()
 	green   = color.New(color.FgGreen, color.Bold).SprintFunc()
@@ -36,14 +34,13 @@ var (
 func main() {
 	root := &cobra.Command{
 		Use:   "aether",
-		Short: "⚡ Aether — High-Performance File Transfer",
+		Short: "Aether -- High-Performance File Transfer",
 		Long:  banner(),
 		Run: func(cmd *cobra.Command, args []string) {
 			fmt.Println(banner())
 		},
 	}
 
-	// ── aether version ───────────────────────────────────────────────
 	root.AddCommand(&cobra.Command{
 		Use:   "version",
 		Short: "Print Aether version",
@@ -52,11 +49,10 @@ func main() {
 		},
 	})
 
-	// ── aether send <filepath> --to <url> ────────────────────────────
 	sendCmd := &cobra.Command{
 		Use:   "send [filepath]",
 		Short: "Chunk and upload a file to an Aether receiver",
-		Long:  "  Split a file into chunks and upload via parallel HTTP streams.\n\n  Example:\n    aether send model.bin --to http://localhost:8080",
+		Long:  "  Split a file and upload via pipelined parallel streams.\n\n  Example:\n    aether send model.bin --to http://localhost:8080",
 		Args:  cobra.ExactArgs(1),
 		RunE:  runSend,
 	}
@@ -65,7 +61,6 @@ func main() {
 	sendCmd.Flags().IntP("workers", "w", 5, "Number of parallel upload workers")
 	root.AddCommand(sendCmd)
 
-	// ── aether receive --port <port> ─────────────────────────────────
 	receiveCmd := &cobra.Command{
 		Use:   "receive",
 		Short: "Start the Aether chunk receiver server",
@@ -81,7 +76,7 @@ func main() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// send command
+// send — pipelined: chunk + upload happen concurrently
 // ──────────────────────────────────────────────────────────────────────
 
 func runSend(cmd *cobra.Command, args []string) error {
@@ -90,7 +85,6 @@ func runSend(cmd *cobra.Command, args []string) error {
 	chunkSizeFlag, _ := cmd.Flags().GetUint32("chunk-size")
 	workers, _ := cmd.Flags().GetInt("workers")
 
-	// ── Resolve absolute path ────────────────────────────────────────
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
 		return fmt.Errorf("resolve path: %w", err)
@@ -109,47 +103,34 @@ func runSend(cmd *cobra.Command, args []string) error {
 	printKV("Size", formatBytes(info.Size()))
 	printKV("Target", targetURL)
 	printKV("Workers", fmt.Sprintf("%d goroutines", workers))
+	printKV("Hash", "BLAKE3-256")
+	printKV("Mode", "pipelined (chunk + upload concurrent)")
 	fmt.Println()
 
-	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-	// STEP 1 — Chunk the file
-	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-	printStep(1, "Chunking file")
-	chunkStart := time.Now()
+	// ── Start pipelined transfer ─────────────────────────────────────
+	printStep("Chunking + uploading (pipelined)")
+	totalStart := time.Now()
 
-	manifest, err := chunker.ChunkFile(absPath, chunkSizeFlag)
+	pipe, err := chunker.ChunkFilePipelined(absPath, chunkSizeFlag)
 	if err != nil {
-		printError("Chunking failed: %v", err)
+		printError("Pipeline init failed: %v", err)
 		return err
 	}
 
-	chunkDur := time.Since(chunkStart)
-	printSuccess("Split into %s chunks (%s each) in %s",
-		bold(fmt.Sprintf("%d", manifest.TotalChunks())),
-		formatBytes(int64(manifest.ChunkSize)),
-		formatDuration(chunkDur),
+	printSuccess("Pipeline started: %s chunks (%s each)",
+		bold(fmt.Sprintf("%d", pipe.TotalChunks)),
+		formatBytes(int64(pipe.ChunkSize)),
 	)
-	printKV("  File Hash", hex.EncodeToString(manifest.FileHash[:16])+"…")
-	fmt.Println()
 
-	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-	// STEP 2 — Upload via worker pool
-	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-	printStep(2, "Uploading chunks")
-	uploadStart := time.Now()
-
-	stats, err := network.Upload(manifest, ".aether_cache", targetURL, workers)
+	stats, err := network.UploadPipelined(pipe, targetURL, workers)
 	if err != nil {
-		printError("Upload failed: %v", err)
+		printError("Transfer failed: %v", err)
 		return err
 	}
 
-	uploadDur := time.Since(uploadStart)
-	totalDur := chunkDur + uploadDur
+	totalDur := time.Since(totalStart)
 
-	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-	// STEP 3 — Summary
-	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+	// ── Summary ──────────────────────────────────────────────────────
 	fmt.Println()
 	printDivider()
 	fmt.Println()
@@ -158,24 +139,20 @@ func runSend(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  %s Transfer complete\n\n", green("✓"))
 	} else {
 		fmt.Printf("  %s Transfer completed with %d failed chunk(s)\n\n",
-			yellow("⚠"), stats.FailCount)
+			yellow("!"), stats.FailCount)
 	}
 
-	// Metrics
 	mbPerSec := 0.0
-	if uploadDur.Seconds() > 0 {
-		mbPerSec = float64(stats.TotalBytes) / (1024 * 1024) / uploadDur.Seconds()
+	if totalDur.Seconds() > 0 {
+		mbPerSec = float64(stats.TotalBytes) / (1024 * 1024) / totalDur.Seconds()
 	}
 
 	printKV("Chunks", fmt.Sprintf("%d/%d %s",
 		stats.SuccessCount, stats.TotalChunks, dim("verified")))
 	printKV("Transferred", formatBytes(stats.TotalBytes))
-	printKV("Chunk Time", formatDuration(chunkDur))
-	printKV("Upload Time", formatDuration(uploadDur))
 	printKV("Total Time", bold(formatDuration(totalDur)))
 	printKV("Throughput", fmt.Sprintf("%s %s",
 		magenta(fmt.Sprintf("%.2f MB/s", mbPerSec)), dim("(avg)")))
-
 	fmt.Println()
 	printKV("Destination", dim(targetURL))
 	fmt.Println()
@@ -184,12 +161,11 @@ func runSend(cmd *cobra.Command, args []string) error {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// receive command
+// receive
 // ──────────────────────────────────────────────────────────────────────
 
 func runReceive(cmd *cobra.Command, args []string) error {
 	port, _ := cmd.Flags().GetInt("port")
-
 	srv := receiver.New(port)
 	return srv.Start()
 }
@@ -212,8 +188,8 @@ func printHeader() {
 	fmt.Print(banner())
 }
 
-func printStep(n int, msg string) {
-	fmt.Printf("  %s %s\n", cyan(fmt.Sprintf("[%d/2]", n)), msg)
+func printStep(msg string) {
+	fmt.Printf("  %s %s\n", cyan(">>"), msg)
 }
 
 func printSuccess(format string, args ...interface{}) {
@@ -257,7 +233,7 @@ func formatBytes(b int64) string {
 func formatDuration(d time.Duration) string {
 	switch {
 	case d < time.Millisecond:
-		return fmt.Sprintf("%.0fµs", float64(d.Microseconds()))
+		return fmt.Sprintf("%.0fus", float64(d.Microseconds()))
 	case d < time.Second:
 		return fmt.Sprintf("%dms", d.Milliseconds())
 	default:

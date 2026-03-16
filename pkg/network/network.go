@@ -1,14 +1,14 @@
 // Package network implements Aether's parallel transfer engine.
 //
 // Architecture:
-//   - A WorkerPool fans out chunk uploads across N goroutines
-//   - Jobs are dispatched via an unbuffered channel (back-pressure)
-//   - Results flow back through a buffered results channel
-//   - A progress bar renders real-time CLI feedback
+//   - Upload accepts a pipelined chunk channel (chunks arrive as they're split)
+//   - Workers start uploading immediately — no waiting for chunking to finish
+//   - Jobs dispatched via unbuffered channel (back-pressure)
+//   - Results flow through buffered results channel
+//   - Progress bar renders real-time CLI feedback
 //
 // Each worker streams a cached chunk file directly into an HTTP POST
-// request body to the target receiver (no intermediate buffer).
-// Chunk metadata is passed via X-Aether-* headers.
+// request body. Chunk metadata passed via X-Aether-* headers.
 package network
 
 import (
@@ -18,7 +18,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,10 +33,7 @@ const (
 	DefaultWorkers = 5
 )
 
-// ──────────────────────────────────────────────────────────────────────
-// Shared HTTP client — connection pooling + sensible timeouts
-// ──────────────────────────────────────────────────────────────────────
-
+// Shared HTTP client with connection pooling and sensible timeouts.
 var httpClient = &http.Client{
 	Timeout: 60 * time.Second,
 	Transport: &http.Transport{
@@ -48,21 +44,17 @@ var httpClient = &http.Client{
 			Timeout:   5 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		DisableCompression:  true, // chunks are binary, compression wastes CPU
-		WriteBufferSize:     256 << 10, // 256 KB write buffer
-		ReadBufferSize:      64 << 10,  // 64 KB read buffer
+		DisableCompression: true,
+		WriteBufferSize:    256 << 10,
+		ReadBufferSize:     64 << 10,
 	},
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// Job / Result types
-// ──────────────────────────────────────────────────────────────────────
-
-// UploadJob represents a single chunk upload task pushed to workers.
+// UploadJob represents a single chunk upload task.
 type UploadJob struct {
 	Chunk     chunker.Chunk
 	ChunkPath string
-	FileID    string // hex-encoded file ID
+	FileID    string
 }
 
 // UploadResult is sent back by a worker after processing a job.
@@ -74,10 +66,6 @@ type UploadResult struct {
 	Duration  time.Duration
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// TransferStats
-// ──────────────────────────────────────────────────────────────────────
-
 // TransferStats holds aggregate metrics after all chunks have been processed.
 type TransferStats struct {
 	TotalChunks   int
@@ -88,22 +76,20 @@ type TransferStats struct {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Upload — the main fan-out orchestrator
+// UploadPipelined — reads from the chunker channel and uploads in parallel
 // ──────────────────────────────────────────────────────────────────────
 
-// Upload fans out chunk uploads across `numWorkers` goroutines,
-// each streaming cached chunk files via HTTP POST to targetURL/upload.
-func Upload(manifest *chunker.FileManifest, cacheDir string, targetURL string, numWorkers int) (*TransferStats, error) {
+// UploadPipelined consumes chunks from a PipelineInfo channel and
+// uploads them in parallel via HTTP POST. Uploads begin as soon as
+// the first chunk is produced — no waiting for the full file to be split.
+func UploadPipelined(pipe *chunker.PipelineInfo, targetURL string, numWorkers int) (*TransferStats, error) {
 	if numWorkers <= 0 {
 		numWorkers = DefaultWorkers
 	}
 
-	// Normalise target URL
 	targetURL = strings.TrimRight(targetURL, "/")
 	uploadURL := targetURL + "/upload"
-
-	fileIDHex := hex.EncodeToString(manifest.FileID[:])
-	totalChunks := len(manifest.Chunks)
+	totalChunks := pipe.TotalChunks
 
 	// ── Channels ─────────────────────────────────────────────────────
 	jobs := make(chan UploadJob)
@@ -111,7 +97,7 @@ func Upload(manifest *chunker.FileManifest, cacheDir string, targetURL string, n
 
 	// ── Progress bar ─────────────────────────────────────────────────
 	bar := progressbar.NewOptions(totalChunks,
-		progressbar.OptionSetDescription("  ⚡ Uploading"),
+		progressbar.OptionSetDescription("  ⚡ Transferring"),
 		progressbar.OptionSetTheme(progressbar.Theme{
 			Saucer:        "█",
 			SaucerHead:    "▓",
@@ -135,23 +121,24 @@ func Upload(manifest *chunker.FileManifest, cacheDir string, targetURL string, n
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				result := processUpload(job, uploadURL)
-				results <- result
+				results <- processUpload(job, uploadURL)
 			}
 		}()
 	}
 
-	// ── Dispatch jobs ────────────────────────────────────────────────
+	// ── Feed from pipeline channel → job channel ─────────────────────
+	// This goroutine bridges the chunker's output to the worker pool.
+	var pipeErr error
 	go func() {
-		for _, c := range manifest.Chunks {
-			chunkPath := filepath.Join(cacheDir,
-				fileIDHex,
-				fmt.Sprintf("%06d.chunk", c.ID),
-			)
+		for cr := range pipe.ChunkCh {
+			if cr.Err != nil {
+				pipeErr = cr.Err
+				break
+			}
 			jobs <- UploadJob{
-				Chunk:     c,
-				ChunkPath: chunkPath,
-				FileID:    fileIDHex,
+				Chunk:     cr.Chunk,
+				ChunkPath: cr.ChunkPath,
+				FileID:    pipe.FileIDHex,
 			}
 		}
 		close(jobs)
@@ -165,7 +152,82 @@ func Upload(manifest *chunker.FileManifest, cacheDir string, targetURL string, n
 
 	// ── Collect results ──────────────────────────────────────────────
 	stats := &TransferStats{TotalChunks: totalChunks}
+	for res := range results {
+		if res.Success {
+			stats.SuccessCount++
+			stats.TotalBytes += int64(res.BytesSent)
+		} else {
+			stats.FailCount++
+		}
+		stats.TotalDuration += res.Duration
+		_ = bar.Add(1)
+	}
 
+	if pipeErr != nil {
+		return stats, fmt.Errorf("chunking pipeline error: %w", pipeErr)
+	}
+
+	return stats, nil
+}
+
+// Upload is the legacy batch API. It takes a completed manifest and uploads.
+func Upload(manifest *chunker.FileManifest, cacheDir string, targetURL string, numWorkers int) (*TransferStats, error) {
+	if numWorkers <= 0 {
+		numWorkers = DefaultWorkers
+	}
+
+	targetURL = strings.TrimRight(targetURL, "/")
+	uploadURL := targetURL + "/upload"
+
+	fileIDHex := hex.EncodeToString(manifest.FileID[:])
+	totalChunks := len(manifest.Chunks)
+
+	jobs := make(chan UploadJob)
+	results := make(chan UploadResult, totalChunks)
+
+	bar := progressbar.NewOptions(totalChunks,
+		progressbar.OptionSetDescription("  ⚡ Uploading"),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "█",
+			SaucerHead:    "▓",
+			SaucerPadding: "░",
+			BarStart:      "│",
+			BarEnd:        "│",
+		}),
+		progressbar.OptionShowCount(),
+		progressbar.OptionShowBytes(false),
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionClearOnFinish(),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Println()
+		}),
+	)
+
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				results <- processUpload(job, uploadURL)
+			}
+		}()
+	}
+
+	go func() {
+		for _, c := range manifest.Chunks {
+			chunkPath := fmt.Sprintf("%s/%s/%06d.chunk", cacheDir, fileIDHex, c.ID)
+			jobs <- UploadJob{Chunk: c, ChunkPath: chunkPath, FileID: fileIDHex}
+		}
+		close(jobs)
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	stats := &TransferStats{TotalChunks: totalChunks}
 	for res := range results {
 		if res.Success {
 			stats.SuccessCount++
@@ -181,19 +243,13 @@ func Upload(manifest *chunker.FileManifest, cacheDir string, targetURL string, n
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Worker logic — real HTTP POST
+// Worker logic
 // ──────────────────────────────────────────────────────────────────────
 
-// processUpload streams a cached chunk file directly into an HTTP POST
-// request body. Chunk metadata is passed via custom headers:
-//   - X-Aether-File-ID:    hex file ID
-//   - X-Aether-Chunk-ID:   chunk index
-//   - X-Aether-Chunk-Hash: hex SHA-256
 func processUpload(job UploadJob, uploadURL string) UploadResult {
 	start := time.Now()
 	result := UploadResult{ChunkID: job.Chunk.ID}
 
-	// Open cached chunk file
 	f, err := os.Open(job.ChunkPath)
 	if err != nil {
 		result.Err = fmt.Errorf("open chunk %d: %w", job.Chunk.ID, err)
@@ -202,7 +258,6 @@ func processUpload(job UploadJob, uploadURL string) UploadResult {
 	}
 	defer f.Close()
 
-	// Get file size for Content-Length (enables efficient transfer)
 	info, err := f.Stat()
 	if err != nil {
 		result.Err = fmt.Errorf("stat chunk %d: %w", job.Chunk.ID, err)
@@ -210,7 +265,6 @@ func processUpload(job UploadJob, uploadURL string) UploadResult {
 		return result
 	}
 
-	// Build HTTP request — stream file directly as request body
 	req, err := http.NewRequest(http.MethodPost, uploadURL, f)
 	if err != nil {
 		result.Err = fmt.Errorf("create request for chunk %d: %w", job.Chunk.ID, err)
@@ -224,7 +278,6 @@ func processUpload(job UploadJob, uploadURL string) UploadResult {
 	req.Header.Set("X-Aether-Chunk-ID", strconv.Itoa(int(job.Chunk.ID)))
 	req.Header.Set("X-Aether-Chunk-Hash", hex.EncodeToString(job.Chunk.Hash[:]))
 
-	// Execute request
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		result.Err = fmt.Errorf("upload chunk %d: %w", job.Chunk.ID, err)
@@ -232,7 +285,7 @@ func processUpload(job UploadJob, uploadURL string) UploadResult {
 		return result
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body) // drain body to allow connection reuse
+	io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		result.Err = fmt.Errorf("chunk %d rejected: HTTP %d", job.Chunk.ID, resp.StatusCode)

@@ -1,8 +1,8 @@
 // Package receiver implements Aether's HTTP chunk receiver.
 //
 // It exposes a single POST /upload endpoint that accepts streamed chunk
-// data, verifies SHA-256 integrity on-the-fly, and persists verified
-// chunks to .aether_cache/<file_id>/.
+// data, verifies BLAKE3-256 integrity on-the-fly, and persists verified
+// chunks to .aether_received/<file_id>/.
 //
 // Designed for high concurrency: the Go HTTP server handles each
 // request in its own goroutine, and I/O is fully streaming (no
@@ -10,10 +10,8 @@
 package receiver
 
 import (
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"hash"
 	"io"
 	"net/http"
 	"os"
@@ -23,6 +21,7 @@ import (
 	"time"
 
 	"github.com/fatih/color"
+	"github.com/zeebo/blake3"
 )
 
 const (
@@ -30,7 +29,6 @@ const (
 	receivedDir = ".aether_received"
 )
 
-// color presets for server logs
 var (
 	cyan  = color.New(color.FgCyan, color.Bold).SprintFunc()
 	green = color.New(color.FgGreen, color.Bold).SprintFunc()
@@ -54,10 +52,9 @@ func New(port int) *Server {
 	return s
 }
 
-// Start begins listening. This blocks until the server is shut down.
+// Start begins listening. Blocks until shut down.
 func (s *Server) Start() error {
 	addr := fmt.Sprintf(":%d", s.Port)
-
 	printBanner(s.Port)
 
 	server := &http.Server{
@@ -66,17 +63,12 @@ func (s *Server) Start() error {
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 16, // 64 KB
+		MaxHeaderBytes:    1 << 16,
 	}
 
 	return server.ListenAndServe()
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// Handlers
-// ──────────────────────────────────────────────────────────────────────
-
-// handleHealth is a simple liveness probe.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -84,22 +76,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleUpload receives a single chunk via streamed POST body.
-//
-// Required headers:
-//   - X-Aether-File-ID:    hex-encoded 16-byte file ID
-//   - X-Aether-Chunk-ID:   integer chunk index
-//   - X-Aether-Chunk-Hash: hex-encoded SHA-256 (64 chars)
-//
-// The body is streamed directly to disk while computing SHA-256.
-// If the computed hash matches X-Aether-Chunk-Hash → 200 OK.
-// Otherwise → 400 Bad Request.
+// Verifies BLAKE3-256 integrity using X-Aether-Chunk-Hash header.
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
 
-	// ── Parse headers ────────────────────────────────────────────────
 	fileID := r.Header.Get("X-Aether-File-ID")
 	chunkIDStr := r.Header.Get("X-Aether-Chunk-ID")
 	expectedHash := r.Header.Get("X-Aether-Chunk-Hash")
@@ -115,14 +98,12 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ── Create destination directory ─────────────────────────────────
 	destDir := filepath.Join(receivedDir, fileID)
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"mkdir: %s"}`, err), http.StatusInternalServerError)
 		return
 	}
 
-	// ── Stream body → disk + SHA-256 ─────────────────────────────────
 	destPath := filepath.Join(destDir, fmt.Sprintf("%06d.chunk", chunkID))
 
 	computedHash, bytesWritten, err := streamToDisk(destPath, r.Body)
@@ -131,13 +112,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ── Verify integrity ─────────────────────────────────────────────
 	computedHex := hex.EncodeToString(computedHash[:])
 
 	if !strings.EqualFold(computedHex, expectedHash) {
-		// Delete the corrupted chunk
 		os.Remove(destPath)
-
 		logChunk(chunkID, fileID, false, bytesWritten)
 		http.Error(w, fmt.Sprintf(
 			`{"error":"hash mismatch","expected":"%s","got":"%s"}`,
@@ -153,12 +131,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"status":"ok","chunk_id":%d,"bytes":%d}`, chunkID, bytesWritten)
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// I/O helpers
-// ──────────────────────────────────────────────────────────────────────
-
-// streamToDisk writes from reader to path while computing SHA-256.
-// Returns the hash, bytes written, and any error.
+// streamToDisk writes from reader to path while computing BLAKE3-256.
 func streamToDisk(path string, body io.Reader) ([32]byte, int64, error) {
 	f, err := os.Create(path)
 	if err != nil {
@@ -166,8 +139,8 @@ func streamToDisk(path string, body io.Reader) ([32]byte, int64, error) {
 	}
 	defer f.Close()
 
-	var h hash.Hash = sha256.New()
-	w := io.MultiWriter(f, h)
+	hasher := blake3.New()
+	w := io.MultiWriter(f, hasher)
 
 	n, err := io.Copy(w, body)
 	if err != nil {
@@ -175,19 +148,16 @@ func streamToDisk(path string, body io.Reader) ([32]byte, int64, error) {
 	}
 
 	var digest [32]byte
-	copy(digest[:], h.Sum(nil))
+	copy(digest[:], hasher.Sum(nil))
 	return digest, n, nil
 }
-
-// ──────────────────────────────────────────────────────────────────────
-// Server log output
-// ──────────────────────────────────────────────────────────────────────
 
 func printBanner(port int) {
 	fmt.Printf("\n  %s  %s %s\n", cyan("▼"), bold("Aether Receiver"), dim("v0.1.0-alpha"))
 	fmt.Printf("  %s\n\n", dim("Listening for incoming chunks"))
 	fmt.Printf("  %s  %s\n", dim("Endpoint"), fmt.Sprintf("http://localhost:%d/upload", port))
 	fmt.Printf("  %s     %s\n", dim("Health"), fmt.Sprintf("http://localhost:%d/health", port))
+	fmt.Printf("  %s    %s\n", dim("Hash"), "BLAKE3-256")
 	fmt.Printf("  %s    %s\n\n", dim("Storage"), receivedDir)
 	fmt.Printf("  %s\n\n", dim("────────────────────────────────────────"))
 }
@@ -202,10 +172,8 @@ func logChunk(chunkID int, fileID string, ok bool, bytes int64) {
 		short = short[:12] + "…"
 	}
 	fmt.Printf("  %s chunk %s  file %s  %s\n",
-		status,
-		bold(fmt.Sprintf("%04d", chunkID)),
-		dim(short),
-		dim(formatBytes(bytes)),
+		status, bold(fmt.Sprintf("%04d", chunkID)),
+		dim(short), dim(formatBytes(bytes)),
 	)
 }
 

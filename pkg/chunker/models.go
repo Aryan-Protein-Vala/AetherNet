@@ -36,7 +36,7 @@ type Chunk struct {
 	// Size is the chunk payload size in bytes (≤ MaxChunkSize).
 	Size uint32 `json:"size"`
 
-	// Hash is the SHA-256 digest of the chunk data (32 bytes, stack-allocated).
+	// Hash is the BLAKE3-256 digest of the chunk data (32 bytes, stack-allocated).
 	Hash [32]byte `json:"hash"`
 
 	// State tracks whether this chunk has been sent / verified.
@@ -56,7 +56,7 @@ type FileManifest struct {
 	// FileSize is the total size of the original file in bytes.
 	FileSize int64 `json:"file_size"`
 
-	// FileHash is the SHA-256 digest of the entire file.
+	// FileHash is the BLAKE3-256 digest of the entire file.
 	FileHash [32]byte `json:"file_hash"`
 
 	// ChunkSize is the chunk size used for this manifest (bytes).
