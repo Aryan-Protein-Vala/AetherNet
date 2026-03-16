@@ -1,17 +1,23 @@
 // Package receiver implements Aether's HTTP chunk receiver.
 //
-// It exposes a single POST /upload endpoint that accepts streamed chunk
-// data, verifies BLAKE3-256 integrity on-the-fly, and persists verified
-// chunks to .aether_received/<file_id>/.
+// It exposes a POST /upload endpoint that accepts streamed chunk data,
+// verifies SHA-256 integrity on-the-fly, and persists verified chunks
+// to .aether_received/<file_id>/.
+//
+// Additional endpoints:
+//   - POST /manifest  — stores file metadata for reassembly
+//   - POST /reassemble — reconstructs original file from chunks
+//   - GET  /health    — liveness probe
 //
 // Designed for high concurrency: the Go HTTP server handles each
-// request in its own goroutine, and I/O is fully streaming (no
-// buffering the entire chunk body in memory).
+// request in its own goroutine. I/O is fully streaming.
 package receiver
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"os"
@@ -21,11 +27,9 @@ import (
 	"time"
 
 	"github.com/fatih/color"
-	"github.com/zeebo/blake3"
 )
 
 const (
-	// receivedDir is the local directory for received chunks.
 	receivedDir = ".aether_received"
 )
 
@@ -74,11 +78,11 @@ func (s *Server) Start() error {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, `{"status":"ok","version":"0.1.0-alpha"}`)
+	fmt.Fprintf(w, `{"status":"ok","version":"0.2.0-alpha"}`)
 }
 
 // handleUpload receives a single chunk via streamed POST body.
-// Verifies BLAKE3-256 integrity using X-Aether-Chunk-Hash header.
+// Verifies SHA-256 integrity using X-Aether-Chunk-Hash header.
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -134,7 +138,6 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleManifest stores file manifest metadata for later reassembly.
-// POST /manifest with X-Aether-File-ID header, JSON body.
 func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -167,7 +170,11 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Printf("  %s manifest saved for %s (%d bytes)\n", green("✓"), dim(fileID[:12]+"…"), n)
+	short := fileID
+	if len(short) > 12 {
+		short = short[:12] + "…"
+	}
+	fmt.Printf("  %s manifest saved for %s (%d bytes)\n", green("✓"), dim(short), n)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -175,7 +182,6 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleReassemble reconstructs the original file from received chunks.
-// POST /reassemble with JSON body: {"file_id":"...", "output_dir":"..."}
 func (s *Server) handleReassemble(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -205,7 +211,7 @@ func (s *Server) handleReassemble(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"status":"ok","path":"%s"}`, outPath)
 }
 
-// streamToDisk writes from reader to path while computing BLAKE3-256.
+// streamToDisk writes from reader to path while computing SHA-256.
 func streamToDisk(path string, body io.Reader) ([32]byte, int64, error) {
 	f, err := os.Create(path)
 	if err != nil {
@@ -213,8 +219,8 @@ func streamToDisk(path string, body io.Reader) ([32]byte, int64, error) {
 	}
 	defer f.Close()
 
-	hasher := blake3.New()
-	w := io.MultiWriter(f, hasher)
+	var h hash.Hash = sha256.New()
+	w := io.MultiWriter(f, h)
 
 	n, err := io.Copy(w, body)
 	if err != nil {
@@ -222,16 +228,16 @@ func streamToDisk(path string, body io.Reader) ([32]byte, int64, error) {
 	}
 
 	var digest [32]byte
-	copy(digest[:], hasher.Sum(nil))
+	copy(digest[:], h.Sum(nil))
 	return digest, n, nil
 }
 
 func printBanner(port int) {
-	fmt.Printf("\n  %s  %s %s\n", cyan("▼"), bold("Aether Receiver"), dim("v0.1.0-alpha"))
+	fmt.Printf("\n  %s  %s %s\n", cyan("▼"), bold("Aether Receiver"), dim("v0.2.0-alpha"))
 	fmt.Printf("  %s\n\n", dim("Listening for incoming chunks"))
 	fmt.Printf("  %s  %s\n", dim("Endpoint"), fmt.Sprintf("http://localhost:%d/upload", port))
 	fmt.Printf("  %s     %s\n", dim("Health"), fmt.Sprintf("http://localhost:%d/health", port))
-	fmt.Printf("  %s    %s\n", dim("Hash"), "BLAKE3-256")
+	fmt.Printf("  %s    %s\n", dim("Hash"), "SHA-256 (hardware-accelerated)")
 	fmt.Printf("  %s    %s\n\n", dim("Storage"), receivedDir)
 	fmt.Printf("  %s\n\n", dim("────────────────────────────────────────"))
 }

@@ -104,7 +104,7 @@ func runSend(cmd *cobra.Command, args []string) error {
 	printKV("Size", formatBytes(info.Size()))
 	printKV("Target", targetURL)
 	printKV("Workers", fmt.Sprintf("%d goroutines", workers))
-	printKV("Hash", "BLAKE3-256")
+	printKV("Hash", "SHA-256 (hardware-accelerated)")
 	printKV("Mode", "pipelined (chunk + upload concurrent)")
 	fmt.Println()
 

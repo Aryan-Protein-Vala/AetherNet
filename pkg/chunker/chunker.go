@@ -7,19 +7,19 @@
 //     are created, allowing uploads to begin while the file is still being split.
 //     This eliminates the sequential chunk-then-upload bottleneck.
 //
-// Hashing uses BLAKE3-256, which is 5-14x faster than SHA-256 on modern CPUs.
+// Hashing uses stdlib crypto/sha256 — zero external deps, hardware-accelerated
+// on modern CPUs (SHA-NI / ARMv8 crypto extensions).
 package chunker
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"time"
-
-	"github.com/zeebo/blake3"
 )
 
 const (
@@ -53,7 +53,6 @@ type PipelineInfo struct {
 // all chunks have been produced (or on first error).
 //
 // The caller can start uploading from ChunkCh while chunking continues.
-// After ChunkCh is drained, call FinishManifest() to get the final manifest.
 func ChunkFilePipelined(filePath string, chunkSize uint32) (*PipelineInfo, error) {
 	if chunkSize == 0 {
 		chunkSize = DefaultChunkSize
@@ -96,7 +95,7 @@ func ChunkFilePipelined(filePath string, chunkSize uint32) (*PipelineInfo, error
 		numChunks++
 	}
 
-	chunkCh := make(chan ChunkResult, 4) // small buffer for pipeline smoothness
+	chunkCh := make(chan ChunkResult, 4)
 
 	pipeline := &PipelineInfo{
 		FileID:      fileID,
@@ -109,13 +108,12 @@ func ChunkFilePipelined(filePath string, chunkSize uint32) (*PipelineInfo, error
 		ChunkCh:     chunkCh,
 	}
 
-	// Background goroutine: read file → produce chunks
 	go func() {
 		defer f.Close()
 		defer close(chunkCh)
 
 		buf := make([]byte, chunkSize)
-		fileHasher := blake3.New()
+		fileHasher := sha256.New()
 
 		var chunkID uint32
 		var offset int64
@@ -123,7 +121,7 @@ func ChunkFilePipelined(filePath string, chunkSize uint32) (*PipelineInfo, error
 		for {
 			n, readErr := readFull(f, buf, fileHasher)
 			if n > 0 {
-				chunkHash := blake3.Sum256(buf[:n])
+				chunkHash := sha256.Sum256(buf[:n])
 
 				chunkPath := filepath.Join(sessionDir, fmt.Sprintf("%06d.chunk", chunkID))
 				if err := writeChunkFile(chunkPath, buf[:n]); err != nil {
@@ -159,9 +157,8 @@ func ChunkFilePipelined(filePath string, chunkSize uint32) (*PipelineInfo, error
 	return pipeline, nil
 }
 
-// ChunkFile is the original batch API. It chunks the entire file and
-// returns a completed FileManifest. Kept for backward compatibility
-// and simpler use cases.
+// ChunkFile is the batch API. Chunks the entire file and returns a
+// completed FileManifest.
 func ChunkFile(filePath string, chunkSize uint32) (*FileManifest, error) {
 	if chunkSize == 0 {
 		chunkSize = DefaultChunkSize
@@ -211,7 +208,7 @@ func ChunkFile(filePath string, chunkSize uint32) (*FileManifest, error) {
 	}
 
 	buf := make([]byte, chunkSize)
-	fileHasher := blake3.New()
+	fileHasher := sha256.New()
 
 	var chunkID uint32
 	var offset int64
@@ -219,7 +216,7 @@ func ChunkFile(filePath string, chunkSize uint32) (*FileManifest, error) {
 	for {
 		n, readErr := readFull(f, buf, fileHasher)
 		if n > 0 {
-			chunkHash := blake3.Sum256(buf[:n])
+			chunkHash := sha256.Sum256(buf[:n])
 
 			chunkPath := filepath.Join(sessionDir, fmt.Sprintf("%06d.chunk", chunkID))
 			if err := writeChunkFile(chunkPath, buf[:n]); err != nil {
@@ -246,10 +243,8 @@ func ChunkFile(filePath string, chunkSize uint32) (*FileManifest, error) {
 		}
 	}
 
-	var fileHash [32]byte
-	bsum := blake3.Sum256(fileHasher.Sum(nil))
-	copy(fileHash[:], bsum[:])
-	copy(manifest.FileHash[:], fileHash[:])
+	fileHash := fileHasher.Sum(nil)
+	copy(manifest.FileHash[:], fileHash)
 
 	return manifest, nil
 }
