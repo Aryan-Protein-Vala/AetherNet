@@ -171,8 +171,8 @@ func runSend(cmd *cobra.Command, args []string) error {
 	if stats.FailCount == 0 {
 		normalizedURL := strings.TrimRight(targetURL, "/")
 		manifestJSON := fmt.Sprintf(
-			`{"file_name":"%s","file_size":%d,"total_chunks":%d,"chunk_size":%d}`,
-			pipe.FileName, pipe.FileSize, pipe.TotalChunks, pipe.ChunkSize,
+			`{"file_name":"%s","file_size":%d,"total_chunks":%d,"chunk_size":%d,"compressed":%t,"encrypted":%t}`,
+			pipe.FileName, pipe.FileSize, pipe.TotalChunks, pipe.ChunkSize, compress, encrypt,
 		)
 		req, _ := http.NewRequest(http.MethodPost,
 			normalizedURL+"/manifest",
@@ -229,12 +229,25 @@ func runFetch(cmd *cobra.Command, args []string) error {
 	relayURL, _ := cmd.Flags().GetString("from")
 	outputDir, _ := cmd.Flags().GetString("out")
 	workers, _ := cmd.Flags().GetInt("workers")
+	password, _ := cmd.Flags().GetString("password")
+
+	// Build download options — encryption key provided by user if needed.
+	// Compress flag is auto-detected from the manifest on the relay.
+	opts := &network.TransferOptions{}
+	if password != "" {
+		opts.Encrypt = true
+		opts.EncryptKey = aecrypto.DeriveKey(password)
+	}
 
 	printHeader()
 	fmt.Println()
 	printKV("File ID", fileID)
 	printKV("Relay", relayURL)
 	printKV("Workers", fmt.Sprintf("%d goroutines", workers))
+	if password != "" {
+		printKV("Decrypt", "AES-256-GCM")
+		printKV("Decompress", "LZ4 (if applicable)")
+	}
 	printKV("Output", outputDir)
 	fmt.Println()
 
@@ -242,7 +255,7 @@ func runFetch(cmd *cobra.Command, args []string) error {
 	printStep("Fetching manifest...")
 	totalStart := time.Now()
 
-	manifest, dlStats, err := network.DownloadPipelined(fileID, relayURL, workers)
+	manifest, dlStats, err := network.DownloadPipelined(fileID, relayURL, workers, opts)
 	if err != nil {
 		printError("Download failed: %v", err)
 		return err

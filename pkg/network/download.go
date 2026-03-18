@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/schollz/progressbar/v3"
+
+	aecrypto "github.com/Aryan-Protein-Vala/AetherNet/pkg/crypto"
 )
 
 // RelayManifest is the JSON structure returned by GET /manifest.
@@ -21,6 +23,8 @@ type RelayManifest struct {
 	FileSize    int64  `json:"file_size"`
 	TotalChunks int    `json:"total_chunks"`
 	ChunkSize   uint32 `json:"chunk_size"`
+	Compressed  bool   `json:"compressed"`
+	Encrypted   bool   `json:"encrypted"`
 }
 
 // DownloadResult is sent back by a download worker.
@@ -41,15 +45,17 @@ type DownloadStats struct {
 }
 
 // DownloadPipelined fetches a file from a relay server.
-// 1. GET /manifest?id=<fileID> to learn about the file
-// 2. Spawn worker pool to concurrently GET /chunk?id=<fileID>&chunk=<n>
-// 3. Verify SHA-256 hash of each chunk against the manifest hash header
-// 4. Store verified chunks in .aether_cache/<fileID>/
-//
-// Returns the manifest and download stats.
-func DownloadPipelined(fileID string, relayURL string, numWorkers int) (*RelayManifest, *DownloadStats, error) {
+// 1. GET /manifest to learn about the file
+// 2. Spawn worker pool to concurrently GET /chunk
+// 3. Verify SHA-256 integrity of each downloaded chunk
+// 4. If opts specify decrypt/decompress, reverse the transforms
+// 5. Store final chunks in .aether_cache/<fileID>/
+func DownloadPipelined(fileID string, relayURL string, numWorkers int, opts *TransferOptions) (*RelayManifest, *DownloadStats, error) {
 	if numWorkers <= 0 {
 		numWorkers = DefaultWorkers
+	}
+	if opts == nil {
+		opts = &TransferOptions{}
 	}
 
 	relayURL = trimSlash(relayURL)
@@ -72,6 +78,11 @@ func DownloadPipelined(fileID string, relayURL string, numWorkers int) (*RelayMa
 		return nil, nil, fmt.Errorf("decode manifest: %w", err)
 	}
 
+	// Auto-configure transform options from manifest flags
+	// Only decompress/decrypt if the sender actually used those transforms
+	opts.Compress = manifest.Compressed
+	opts.Encrypt = manifest.Encrypted && opts.Encrypt // need key from user
+
 	// ── Prepare cache directory ──────────────────────────────────────
 	cacheDir := filepath.Join(".aether_cache", fileID)
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
@@ -81,7 +92,7 @@ func DownloadPipelined(fileID string, relayURL string, numWorkers int) (*RelayMa
 	totalChunks := manifest.TotalChunks
 
 	// ── Channels ─────────────────────────────────────────────────────
-	jobs := make(chan int) // chunk IDs
+	jobs := make(chan int)
 	results := make(chan DownloadResult, totalChunks)
 
 	// ── Progress bar ─────────────────────────────────────────────────
@@ -110,7 +121,7 @@ func DownloadPipelined(fileID string, relayURL string, numWorkers int) (*RelayMa
 		go func() {
 			defer wg.Done()
 			for chunkID := range jobs {
-				results <- downloadChunk(fileID, chunkID, relayURL, cacheDir)
+				results <- downloadChunk(fileID, chunkID, relayURL, cacheDir, opts)
 			}
 		}()
 	}
@@ -145,7 +156,7 @@ func DownloadPipelined(fileID string, relayURL string, numWorkers int) (*RelayMa
 }
 
 // downloadChunk downloads a single chunk with retry + exponential backoff.
-func downloadChunk(fileID string, chunkID int, relayURL string, cacheDir string) DownloadResult {
+func downloadChunk(fileID string, chunkID int, relayURL string, cacheDir string, opts *TransferOptions) DownloadResult {
 	start := time.Now()
 	result := DownloadResult{ChunkID: chunkID}
 
@@ -158,7 +169,7 @@ func downloadChunk(fileID string, chunkID int, relayURL string, cacheDir string)
 			backoff *= 2
 		}
 
-		lastErr = doDownload(fileID, chunkID, relayURL, cacheDir, &result)
+		lastErr = doDownload(fileID, chunkID, relayURL, cacheDir, &result, opts)
 		if lastErr == nil {
 			result.Success = true
 			result.Duration = time.Since(start)
@@ -173,7 +184,8 @@ func downloadChunk(fileID string, chunkID int, relayURL string, cacheDir string)
 }
 
 // doDownload performs a single chunk download attempt.
-func doDownload(fileID string, chunkID int, relayURL string, cacheDir string, result *DownloadResult) error {
+// Pipeline: download → verify hash → decrypt → decompress → write to disk
+func doDownload(fileID string, chunkID int, relayURL string, cacheDir string, result *DownloadResult, opts *TransferOptions) error {
 	chunkURL := fmt.Sprintf("%s/chunk?id=%s&chunk=%d", relayURL, fileID, chunkID)
 
 	resp, err := httpClient.Get(chunkURL)
@@ -187,34 +199,47 @@ func doDownload(fileID string, chunkID int, relayURL string, cacheDir string, re
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
-	// Stream to disk while computing SHA-256
-	chunkPath := filepath.Join(cacheDir, fmt.Sprintf("%06d.chunk", chunkID))
-	f, err := os.Create(chunkPath)
+	// Read entire chunk into memory (needed for decrypt/decompress)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("create: %w", err)
-	}
-	defer f.Close()
-
-	hasher := sha256.New()
-	w := io.MultiWriter(f, hasher)
-
-	n, err := io.Copy(w, resp.Body)
-	if err != nil {
-		os.Remove(chunkPath)
-		return fmt.Errorf("write: %w", err)
+		return fmt.Errorf("read body: %w", err)
 	}
 
-	// Verify hash from response header if present
+	// Verify SHA-256 of the on-wire data (before any transforms)
 	expectedHash := resp.Header.Get("X-Aether-Chunk-Hash")
 	if expectedHash != "" {
-		computedHex := hex.EncodeToString(hasher.Sum(nil))
+		computedHash := sha256.Sum256(data)
+		computedHex := hex.EncodeToString(computedHash[:])
 		if computedHex != expectedHash {
-			os.Remove(chunkPath)
-			return fmt.Errorf("hash mismatch")
+			return fmt.Errorf("hash mismatch (on-wire)")
 		}
 	}
 
-	result.BytesRecv = n
+	// Reverse transforms: decrypt first, then decompress
+	// (upload does: compress → encrypt, so download does: decrypt → decompress)
+	if opts.Encrypt {
+		decrypted, err := aecrypto.Decrypt(data, opts.EncryptKey)
+		if err != nil {
+			return fmt.Errorf("decrypt: %w", err)
+		}
+		data = decrypted
+	}
+
+	if opts.Compress {
+		decompressed, err := aecrypto.DecompressLZ4(data)
+		if err != nil {
+			return fmt.Errorf("decompress: %w", err)
+		}
+		data = decompressed
+	}
+
+	// Write final plaintext chunk to disk
+	chunkPath := filepath.Join(cacheDir, fmt.Sprintf("%06d.chunk", chunkID))
+	if err := os.WriteFile(chunkPath, data, 0o644); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+
+	result.BytesRecv = int64(len(data))
 	return nil
 }
 
