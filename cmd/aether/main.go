@@ -1,7 +1,10 @@
-// Aether CLI — High-performance file transfer tool.
+// Aether CLI — High-performance file transfer via relay architecture.
 //
-// Built with spf13/cobra. Uses pipelined architecture: chunking and
-// uploading happen concurrently for maximum throughput.
+// Commands:
+//   aether send  <file> --to <relay>     Upload to relay
+//   aether fetch <fileID> --from <relay>  Download from relay
+//   aether relay --port <port>           Start a relay server
+//   aether version                       Print version
 package main
 
 import (
@@ -20,25 +23,28 @@ import (
 	"github.com/Aryan-Protein-Vala/AetherNet/pkg/receiver"
 )
 
-const version = "0.2.0-alpha"
+const (
+	version         = "0.3.0-alpha"
+	DefaultRelayURL = "http://localhost:8080"
+)
 
 var (
-	cyan    = color.New(color.FgCyan, color.Bold).SprintFunc()
-	green   = color.New(color.FgGreen, color.Bold).SprintFunc()
-	red     = color.New(color.FgRed, color.Bold).SprintFunc()
-	dim     = color.New(color.Faint).SprintFunc()
-	bold    = color.New(color.Bold).SprintFunc()
-	yellow  = color.New(color.FgYellow).SprintFunc()
-	magenta = color.New(color.FgMagenta, color.Bold).SprintFunc()
+	cyanC   = color.New(color.FgCyan, color.Bold).SprintFunc()
+	greenC  = color.New(color.FgGreen, color.Bold).SprintFunc()
+	redC    = color.New(color.FgRed, color.Bold).SprintFunc()
+	dimC    = color.New(color.Faint).SprintFunc()
+	boldC   = color.New(color.Bold).SprintFunc()
+	yellowC = color.New(color.FgYellow).SprintFunc()
+	magC    = color.New(color.FgMagenta, color.Bold).SprintFunc()
+	whiteB  = color.New(color.FgWhite, color.Bold, color.BgMagenta).SprintFunc()
 )
 
 func main() {
 	root := &cobra.Command{
 		Use:   "aether",
 		Short: "Aether -- High-Performance File Transfer",
-		Long:  banner(),
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Println(banner())
+			fmt.Print(banner())
 		},
 	}
 
@@ -46,30 +52,41 @@ func main() {
 		Use:   "version",
 		Short: "Print Aether version",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Printf("  %s %s\n", cyan("aether"), dim("v"+version))
+			fmt.Printf("  %s %s\n", cyanC("aether"), dimC("v"+version))
 		},
 	})
 
+	// ── send ──────────────────────────────────────────────────────────
 	sendCmd := &cobra.Command{
 		Use:   "send [filepath]",
-		Short: "Chunk and upload a file to an Aether receiver",
-		Long:  "  Split a file and upload via pipelined parallel streams.\n\n  Example:\n    aether send model.bin --to http://localhost:8080",
+		Short: "Chunk and upload a file to an Aether relay",
 		Args:  cobra.ExactArgs(1),
 		RunE:  runSend,
 	}
-	sendCmd.Flags().StringP("to", "t", "http://localhost:8080", "Target receiver URL")
-	sendCmd.Flags().Uint32P("chunk-size", "c", 0, "Chunk size in bytes (default: 2MB)")
-	sendCmd.Flags().IntP("workers", "w", 5, "Number of parallel upload workers")
+	sendCmd.Flags().StringP("to", "t", DefaultRelayURL, "Relay server URL")
+	sendCmd.Flags().IntP("workers", "w", 5, "Parallel upload workers")
 	root.AddCommand(sendCmd)
 
-	receiveCmd := &cobra.Command{
-		Use:   "receive",
-		Short: "Start the Aether chunk receiver server",
-		Long:  "  Start an HTTP server that accepts incoming chunk uploads.\n\n  Example:\n    aether receive --port 8080",
-		RunE:  runReceive,
+	// ── fetch ─────────────────────────────────────────────────────────
+	fetchCmd := &cobra.Command{
+		Use:   "fetch [fileID]",
+		Short: "Download a file from an Aether relay and reassemble it",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runFetch,
 	}
-	receiveCmd.Flags().IntP("port", "p", 8080, "Port to listen on")
-	root.AddCommand(receiveCmd)
+	fetchCmd.Flags().StringP("from", "f", DefaultRelayURL, "Relay server URL")
+	fetchCmd.Flags().StringP("out", "o", ".", "Output directory")
+	fetchCmd.Flags().IntP("workers", "w", 5, "Parallel download workers")
+	root.AddCommand(fetchCmd)
+
+	// ── relay ─────────────────────────────────────────────────────────
+	relayCmd := &cobra.Command{
+		Use:   "relay",
+		Short: "Start an Aether relay server",
+		RunE:  runRelay,
+	}
+	relayCmd.Flags().IntP("port", "p", 8080, "Port to listen on")
+	root.AddCommand(relayCmd)
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
@@ -77,13 +94,12 @@ func main() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// send — pipelined: chunk + upload happen concurrently
+// send — upload to relay
 // ──────────────────────────────────────────────────────────────────────
 
 func runSend(cmd *cobra.Command, args []string) error {
 	filePath := args[0]
 	targetURL, _ := cmd.Flags().GetString("to")
-	chunkSizeFlag, _ := cmd.Flags().GetUint32("chunk-size")
 	workers, _ := cmd.Flags().GetInt("workers")
 
 	absPath, err := filepath.Abs(filePath)
@@ -97,29 +113,27 @@ func runSend(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// ── Header ───────────────────────────────────────────────────────
 	printHeader()
 	fmt.Println()
 	printKV("File", filepath.Base(absPath))
 	printKV("Size", formatBytes(info.Size()))
-	printKV("Target", targetURL)
+	printKV("Relay", targetURL)
 	printKV("Workers", fmt.Sprintf("%d goroutines", workers))
-	printKV("Hash", "SHA-256 (hardware-accelerated)")
+	printKV("Hash", "SHA-256")
 	printKV("Mode", "pipelined (chunk + upload concurrent)")
 	fmt.Println()
 
-	// ── Start pipelined transfer ─────────────────────────────────────
 	printStep("Chunking + uploading (pipelined)")
 	totalStart := time.Now()
 
-	pipe, err := chunker.ChunkFilePipelined(absPath, chunkSizeFlag)
+	pipe, err := chunker.ChunkFilePipelined(absPath, 0)
 	if err != nil {
 		printError("Pipeline init failed: %v", err)
 		return err
 	}
 
 	printSuccess("Pipeline started: %s chunks (%s each)",
-		bold(fmt.Sprintf("%d", pipe.TotalChunks)),
+		boldC(fmt.Sprintf("%d", pipe.TotalChunks)),
 		formatBytes(int64(pipe.ChunkSize)),
 	)
 
@@ -129,11 +143,9 @@ func runSend(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// ── Send manifest + trigger reassembly ───────────────────────────
+	// Send manifest to relay (no reassembly trigger)
 	if stats.FailCount == 0 {
 		normalizedURL := strings.TrimRight(targetURL, "/")
-
-		// Send manifest so receiver knows the original filename
 		manifestJSON := fmt.Sprintf(
 			`{"file_name":"%s","file_size":%d,"total_chunks":%d,"chunk_size":%d}`,
 			pipe.FileName, pipe.FileSize, pipe.TotalChunks, pipe.ChunkSize,
@@ -145,11 +157,6 @@ func runSend(cmd *cobra.Command, args []string) error {
 		req.Header.Set("X-Aether-File-ID", pipe.FileIDHex)
 		req.Header.Set("Content-Type", "application/json")
 		http.DefaultClient.Do(req)
-
-		// Trigger reassembly
-		req2, _ := http.NewRequest(http.MethodPost, normalizedURL+"/reassemble", nil)
-		req2.Header.Set("X-Aether-File-ID", pipe.FileIDHex)
-		http.DefaultClient.Do(req2)
 	}
 
 	totalDur := time.Since(totalStart)
@@ -160,10 +167,10 @@ func runSend(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 
 	if stats.FailCount == 0 {
-		fmt.Printf("  %s Transfer complete\n\n", green("✓"))
+		fmt.Printf("  %s Transfer complete\n\n", greenC("✓"))
 	} else {
 		fmt.Printf("  %s Transfer completed with %d failed chunk(s)\n\n",
-			yellow("!"), stats.FailCount)
+			yellowC("!"), stats.FailCount)
 	}
 
 	mbPerSec := 0.0
@@ -172,23 +179,114 @@ func runSend(cmd *cobra.Command, args []string) error {
 	}
 
 	printKV("Chunks", fmt.Sprintf("%d/%d %s",
-		stats.SuccessCount, stats.TotalChunks, dim("verified")))
+		stats.SuccessCount, stats.TotalChunks, dimC("verified")))
 	printKV("Transferred", formatBytes(stats.TotalBytes))
-	printKV("Total Time", bold(formatDuration(totalDur)))
+	printKV("Total Time", boldC(formatDuration(totalDur)))
 	printKV("Throughput", fmt.Sprintf("%s %s",
-		magenta(fmt.Sprintf("%.2f MB/s", mbPerSec)), dim("(avg)")))
+		magC(fmt.Sprintf("%.2f MB/s", mbPerSec)), dimC("(avg)")))
 	fmt.Println()
-	printKV("Destination", dim(targetURL))
+
+	// ── Share instruction ────────────────────────────────────────────
+	if stats.FailCount == 0 {
+		fmt.Printf("  %s Tell your recipient to run:\n\n", cyanC("→"))
+		fmt.Printf("    %s\n\n",
+			whiteB(fmt.Sprintf(" aether fetch %s ", pipe.FileIDHex)))
+	}
+
+	return nil
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// fetch — download from relay + reassemble
+// ──────────────────────────────────────────────────────────────────────
+
+func runFetch(cmd *cobra.Command, args []string) error {
+	fileID := args[0]
+	relayURL, _ := cmd.Flags().GetString("from")
+	outputDir, _ := cmd.Flags().GetString("out")
+	workers, _ := cmd.Flags().GetInt("workers")
+
+	printHeader()
+	fmt.Println()
+	printKV("File ID", fileID)
+	printKV("Relay", relayURL)
+	printKV("Workers", fmt.Sprintf("%d goroutines", workers))
+	printKV("Output", outputDir)
+	fmt.Println()
+
+	// ── Fetch manifest ───────────────────────────────────────────────
+	printStep("Fetching manifest...")
+	totalStart := time.Now()
+
+	manifest, dlStats, err := network.DownloadPipelined(fileID, relayURL, workers)
+	if err != nil {
+		printError("Download failed: %v", err)
+		return err
+	}
+
+	if manifest != nil {
+		printSuccess("File: %s (%s, %d chunks)",
+			boldC(manifest.FileName),
+			formatBytes(manifest.FileSize),
+			manifest.TotalChunks,
+		)
+	}
+
+	// ── Reassemble ───────────────────────────────────────────────────
+	fmt.Println()
+	printStep("Reassembling file...")
+
+	// We need to copy manifest.json into the cache dir so Reassemble can find the filename
+	cacheManifestDir := filepath.Join(".aether_cache", fileID)
+	os.MkdirAll(cacheManifestDir, 0o755)
+	if manifest != nil {
+		manifestJSON := fmt.Sprintf(
+			`{"file_name":"%s","file_size":%d,"total_chunks":%d,"chunk_size":%d}`,
+			manifest.FileName, manifest.FileSize, manifest.TotalChunks, manifest.ChunkSize,
+		)
+		os.WriteFile(
+			filepath.Join(cacheManifestDir, "manifest.json"),
+			[]byte(manifestJSON), 0o644,
+		)
+	}
+
+	outPath, err := receiver.ReassembleFromCache(fileID, outputDir)
+	if err != nil {
+		printError("Reassembly failed: %v", err)
+		return err
+	}
+
+	totalDur := time.Since(totalStart)
+
+	// ── Summary ──────────────────────────────────────────────────────
+	fmt.Println()
+	printDivider()
+	fmt.Println()
+
+	fmt.Printf("  %s Download complete\n\n", greenC("✓"))
+
+	mbPerSec := 0.0
+	if totalDur.Seconds() > 0 {
+		mbPerSec = float64(dlStats.TotalBytes) / (1024 * 1024) / totalDur.Seconds()
+	}
+
+	printKV("Chunks", fmt.Sprintf("%d/%d %s",
+		dlStats.SuccessCount, dlStats.TotalChunks, dimC("verified")))
+	printKV("Downloaded", formatBytes(dlStats.TotalBytes))
+	printKV("Total Time", boldC(formatDuration(totalDur)))
+	printKV("Throughput", fmt.Sprintf("%s %s",
+		magC(fmt.Sprintf("%.2f MB/s", mbPerSec)), dimC("(avg)")))
+	printKV("Output", boldC(outPath))
 	fmt.Println()
 
 	return nil
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// receive
+// relay — start relay server (renamed from "receive")
 // ──────────────────────────────────────────────────────────────────────
 
-func runReceive(cmd *cobra.Command, args []string) error {
+func runRelay(cmd *cobra.Command, args []string) error {
 	port, _ := cmd.Flags().GetInt("port")
 	srv := receiver.New(port)
 	return srv.Start()
@@ -199,41 +297,24 @@ func runReceive(cmd *cobra.Command, args []string) error {
 // ──────────────────────────────────────────────────────────────────────
 
 func banner() string {
-	return fmt.Sprintf(`
-  %s  %s
-  %s
-`,
-		cyan("▲"), bold("Aether"),
-		dim("High-Performance File Transfer Engine"),
+	return fmt.Sprintf("\n  %s  %s\n  %s\n\n",
+		cyanC("▲"), boldC("Aether"),
+		dimC("High-Performance File Transfer Engine"),
 	)
 }
 
-func printHeader() {
-	fmt.Print(banner())
-}
-
-func printStep(msg string) {
-	fmt.Printf("  %s %s\n", cyan(">>"), msg)
-}
-
-func printSuccess(format string, args ...interface{}) {
-	fmt.Printf("  %s %s\n", green("✓"), fmt.Sprintf(format, args...))
-}
-
-func printError(format string, args ...interface{}) {
-	fmt.Printf("  %s %s\n", red("✗"), fmt.Sprintf(format, args...))
-}
+func printHeader()                              { fmt.Print(banner()) }
+func printStep(msg string)                      { fmt.Printf("  %s %s\n", cyanC(">>"), msg) }
+func printSuccess(f string, a ...interface{})   { fmt.Printf("  %s %s\n", greenC("✓"), fmt.Sprintf(f, a...)) }
+func printError(f string, a ...interface{})     { fmt.Printf("  %s %s\n", redC("✗"), fmt.Sprintf(f, a...)) }
+func printDivider()                             { fmt.Printf("  %s\n", dimC("────────────────────────────────────────")) }
 
 func printKV(key, value string) {
 	padding := 14 - len(key)
 	if padding < 1 {
 		padding = 1
 	}
-	fmt.Printf("  %s%s%s\n", dim(key), strings.Repeat(" ", padding), value)
-}
-
-func printDivider() {
-	fmt.Printf("  %s\n", dim("────────────────────────────────────────"))
+	fmt.Printf("  %s%s%s\n", dimC(key), strings.Repeat(" ", padding), value)
 }
 
 func formatBytes(b int64) string {

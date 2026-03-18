@@ -11,18 +11,24 @@ import (
 	"strings"
 )
 
-// Reassemble reads all chunks from a received file directory and
+// Reassemble reads all chunks from .aether_received/<fileID>/ and
 // concatenates them in order to produce the original file.
-// It returns the path to the reassembled file.
 func Reassemble(fileID string, outputDir string) (string, error) {
-	srcDir := filepath.Join(receivedDir, fileID)
+	return reassembleFrom(filepath.Join(receivedDir, fileID), outputDir)
+}
 
+// ReassembleFromCache reads chunks from .aether_cache/<fileID>/
+// and reassembles them. Used by the client after downloading chunks.
+func ReassembleFromCache(fileID string, outputDir string) (string, error) {
+	return reassembleFrom(filepath.Join(".aether_cache", fileID), outputDir)
+}
+
+func reassembleFrom(srcDir string, outputDir string) (string, error) {
 	entries, err := os.ReadDir(srcDir)
 	if err != nil {
 		return "", fmt.Errorf("read chunk dir: %w", err)
 	}
 
-	// Collect and sort chunk files by ID
 	type chunkFile struct {
 		id   int
 		path string
@@ -42,15 +48,15 @@ func Reassemble(fileID string, outputDir string) (string, error) {
 	}
 
 	if len(chunks) == 0 {
-		return "", fmt.Errorf("no chunks found for file %s", fileID)
+		return "", fmt.Errorf("no chunks found in %s", srcDir)
 	}
 
 	sort.Slice(chunks, func(i, j int) bool {
 		return chunks[i].id < chunks[j].id
 	})
 
-	// Read manifest if available to get original filename
-	outputName := fmt.Sprintf("aether_received_%s", fileID[:12])
+	// Try to read manifest for original filename
+	outputName := fmt.Sprintf("aether_download_%s", filepath.Base(srcDir)[:12])
 	manifestPath := filepath.Join(srcDir, "manifest.json")
 	if data, err := os.ReadFile(manifestPath); err == nil {
 		var m struct {
@@ -72,25 +78,22 @@ func Reassemble(fileID string, outputDir string) (string, error) {
 	}
 	defer out.Close()
 
-	var totalBytes int64
 	for _, c := range chunks {
 		f, err := os.Open(c.path)
 		if err != nil {
 			return "", fmt.Errorf("open chunk %d: %w", c.id, err)
 		}
-		n, err := io.Copy(out, f)
+		_, err = io.Copy(out, f)
 		f.Close()
 		if err != nil {
 			return "", fmt.Errorf("copy chunk %d: %w", c.id, err)
 		}
-		totalBytes += n
 	}
 
 	return outPath, nil
 }
 
-// ListReceivedFiles returns a list of file IDs that have chunks in
-// the received directory.
+// ListReceivedFiles returns file IDs in the received directory.
 func ListReceivedFiles() ([]string, error) {
 	entries, err := os.ReadDir(receivedDir)
 	if err != nil {

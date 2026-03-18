@@ -1,16 +1,15 @@
-// Package receiver implements Aether's HTTP chunk receiver.
+// Package receiver implements Aether's relay server.
 //
-// It exposes a POST /upload endpoint that accepts streamed chunk data,
-// verifies SHA-256 integrity on-the-fly, and persists verified chunks
-// to .aether_received/<file_id>/.
+// The relay is a dumb, fast chunk storage node. It accepts uploaded
+// chunks via POST /upload, stores manifests, and serves both back
+// via GET endpoints so a recipient can download and reassemble locally.
 //
-// Additional endpoints:
-//   - POST /manifest  — stores file metadata for reassembly
-//   - POST /reassemble — reconstructs original file from chunks
-//   - GET  /health    — liveness probe
-//
-// Designed for high concurrency: the Go HTTP server handles each
-// request in its own goroutine. I/O is fully streaming.
+// Endpoints:
+//   - POST /upload     — accept a streamed chunk (SHA-256 verified)
+//   - POST /manifest   — store file manifest JSON
+//   - GET  /manifest   — retrieve manifest by file ID
+//   - GET  /chunk      — stream a stored chunk back to the requester
+//   - GET  /health     — liveness probe
 package receiver
 
 import (
@@ -41,19 +40,19 @@ var (
 	bold  = color.New(color.Bold).SprintFunc()
 )
 
-// Server is the Aether chunk receiver.
+// Server is the Aether relay.
 type Server struct {
 	Port int
 	mux  *http.ServeMux
 }
 
-// New creates a new receiver Server on the given port.
+// New creates a new relay Server.
 func New(port int) *Server {
 	s := &Server{Port: port}
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("/upload", s.handleUpload)
 	s.mux.HandleFunc("/manifest", s.handleManifest)
-	s.mux.HandleFunc("/reassemble", s.handleReassemble)
+	s.mux.HandleFunc("/chunk", s.handleGetChunk)
 	s.mux.HandleFunc("/health", s.handleHealth)
 	return s
 }
@@ -67,7 +66,7 @@ func (s *Server) Start() error {
 		Addr:              addr,
 		Handler:           s.mux,
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      60 * time.Second,
+		WriteTimeout:      120 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 16,
 	}
@@ -75,14 +74,19 @@ func (s *Server) Start() error {
 	return server.ListenAndServe()
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// POST /health
+// ──────────────────────────────────────────────────────────────────────
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, `{"status":"ok","version":"0.2.0-alpha"}`)
+	fmt.Fprintf(w, `{"status":"ok","version":"0.3.0-alpha","role":"relay"}`)
 }
 
-// handleUpload receives a single chunk via streamed POST body.
-// Verifies SHA-256 integrity using X-Aether-Chunk-Hash header.
+// ──────────────────────────────────────────────────────────────────────
+// POST /upload — accept a chunk (unchanged from before)
+// ──────────────────────────────────────────────────────────────────────
+
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -111,7 +115,6 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	destPath := filepath.Join(destDir, fmt.Sprintf("%06d.chunk", chunkID))
-
 	computedHash, bytesWritten, err := streamToDisk(destPath, r.Body)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"write: %s"}`, err), http.StatusInternalServerError)
@@ -119,7 +122,6 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	computedHex := hex.EncodeToString(computedHash[:])
-
 	if !strings.EqualFold(computedHex, expectedHash) {
 		os.Remove(destPath)
 		logChunk(chunkID, fileID, false, bytesWritten)
@@ -133,17 +135,25 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	logChunk(chunkID, fileID, true, bytesWritten)
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"status":"ok","chunk_id":%d,"bytes":%d}`, chunkID, bytesWritten)
 }
 
-// handleManifest stores file manifest metadata for later reassembly.
-func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-		return
-	}
+// ──────────────────────────────────────────────────────────────────────
+// POST /manifest — store manifest, GET /manifest?id= — retrieve it
+// ──────────────────────────────────────────────────────────────────────
 
+func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		s.storeManifest(w, r)
+	case http.MethodGet:
+		s.getManifest(w, r)
+	default:
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) storeManifest(w http.ResponseWriter, r *http.Request) {
 	fileID := r.Header.Get("X-Aether-File-ID")
 	if fileID == "" {
 		http.Error(w, `{"error":"missing X-Aether-File-ID"}`, http.StatusBadRequest)
@@ -159,14 +169,14 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 	manifestPath := filepath.Join(destDir, "manifest.json")
 	f, err := os.Create(manifestPath)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"create manifest: %s"}`, err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf(`{"error":"create: %s"}`, err), http.StatusInternalServerError)
 		return
 	}
 	defer f.Close()
 
 	n, err := io.Copy(f, r.Body)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"write manifest: %s"}`, err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf(`{"error":"write: %s"}`, err), http.StatusInternalServerError)
 		return
 	}
 
@@ -174,44 +184,86 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 	if len(short) > 12 {
 		short = short[:12] + "…"
 	}
-	fmt.Printf("  %s manifest saved for %s (%d bytes)\n", green("✓"), dim(short), n)
+	fmt.Printf("  %s manifest stored  file %s  %d bytes\n", green("✓"), dim(short), n)
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"status":"ok","bytes":%d}`, n)
 }
 
-// handleReassemble reconstructs the original file from received chunks.
-func (s *Server) handleReassemble(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+func (s *Server) getManifest(w http.ResponseWriter, r *http.Request) {
+	fileID := r.URL.Query().Get("id")
+	if fileID == "" {
+		http.Error(w, `{"error":"missing ?id= parameter"}`, http.StatusBadRequest)
+		return
+	}
+
+	manifestPath := filepath.Join(receivedDir, fileID, "manifest.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, `{"error":"manifest not found"}`, http.StatusNotFound)
+		} else {
+			http.Error(w, fmt.Sprintf(`{"error":"read: %s"}`, err), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// GET /chunk?id=<fileID>&chunk=<chunkID> — stream a chunk back
+// ──────────────────────────────────────────────────────────────────────
+
+func (s *Server) handleGetChunk(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
 
-	fileID := r.Header.Get("X-Aether-File-ID")
-	outputDir := r.Header.Get("X-Aether-Output-Dir")
-	if fileID == "" {
-		http.Error(w, `{"error":"missing X-Aether-File-ID"}`, http.StatusBadRequest)
+	fileID := r.URL.Query().Get("id")
+	chunkIDStr := r.URL.Query().Get("chunk")
+
+	if fileID == "" || chunkIDStr == "" {
+		http.Error(w, `{"error":"missing ?id= or ?chunk= parameter"}`, http.StatusBadRequest)
 		return
 	}
-	if outputDir == "" {
-		outputDir = "."
-	}
 
-	outPath, err := Reassemble(fileID, outputDir)
+	chunkID, err := strconv.Atoi(chunkIDStr)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"reassemble: %s"}`, err), http.StatusInternalServerError)
+		http.Error(w, `{"error":"invalid chunk parameter"}`, http.StatusBadRequest)
 		return
 	}
 
-	fmt.Printf("  %s file reassembled: %s\n", green("✓"), bold(outPath))
+	chunkPath := filepath.Join(receivedDir, fileID, fmt.Sprintf("%06d.chunk", chunkID))
+	f, err := os.Open(chunkPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, `{"error":"chunk not found"}`, http.StatusNotFound)
+		} else {
+			http.Error(w, fmt.Sprintf(`{"error":"open: %s"}`, err), http.StatusInternalServerError)
+		}
+		return
+	}
+	defer f.Close()
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, `{"status":"ok","path":"%s"}`, outPath)
+	info, err := f.Stat()
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"stat: %s"}`, err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+	w.Header().Set("X-Aether-Chunk-ID", chunkIDStr)
+	io.Copy(w, f)
 }
 
-// streamToDisk writes from reader to path while computing SHA-256.
+// ──────────────────────────────────────────────────────────────────────
+// I/O helpers
+// ──────────────────────────────────────────────────────────────────────
+
 func streamToDisk(path string, body io.Reader) ([32]byte, int64, error) {
 	f, err := os.Create(path)
 	if err != nil {
@@ -232,18 +284,24 @@ func streamToDisk(path string, body io.Reader) ([32]byte, int64, error) {
 	return digest, n, nil
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Logging
+// ──────────────────────────────────────────────────────────────────────
+
 func printBanner(port int) {
-	fmt.Printf("\n  %s  %s %s\n", cyan("▼"), bold("Aether Receiver"), dim("v0.2.0-alpha"))
-	fmt.Printf("  %s\n\n", dim("Listening for incoming chunks"))
-	fmt.Printf("  %s  %s\n", dim("Endpoint"), fmt.Sprintf("http://localhost:%d/upload", port))
-	fmt.Printf("  %s     %s\n", dim("Health"), fmt.Sprintf("http://localhost:%d/health", port))
-	fmt.Printf("  %s    %s\n", dim("Hash"), "SHA-256 (hardware-accelerated)")
-	fmt.Printf("  %s    %s\n\n", dim("Storage"), receivedDir)
+	fmt.Printf("\n  %s  %s %s\n", cyan("▼"), bold("Aether Relay"), dim("v0.3.0-alpha"))
+	fmt.Printf("  %s\n\n", dim("Public chunk storage relay"))
+	fmt.Printf("  %s   %s\n", dim("Upload"), fmt.Sprintf("POST http://localhost:%d/upload", port))
+	fmt.Printf("  %s %s\n", dim("Manifest"), fmt.Sprintf("GET  http://localhost:%d/manifest?id=<fileID>", port))
+	fmt.Printf("  %s    %s\n", dim("Chunk"), fmt.Sprintf("GET  http://localhost:%d/chunk?id=<fileID>&chunk=<n>", port))
+	fmt.Printf("  %s   %s\n", dim("Health"), fmt.Sprintf("GET  http://localhost:%d/health", port))
+	fmt.Printf("  %s     %s\n", dim("Hash"), "SHA-256 (hardware-accelerated)")
+	fmt.Printf("  %s  %s\n\n", dim("Storage"), receivedDir)
 	fmt.Printf("  %s\n\n", dim("────────────────────────────────────────"))
 }
 
 func logChunk(chunkID int, fileID string, ok bool, bytes int64) {
-	status := green("✓")
+	status := green("▲")
 	if !ok {
 		status = red("✗")
 	}
