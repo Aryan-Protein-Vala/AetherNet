@@ -12,6 +12,8 @@
 package network
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -26,12 +28,20 @@ import (
 	"github.com/schollz/progressbar/v3"
 
 	"github.com/Aryan-Protein-Vala/AetherNet/pkg/chunker"
+	aecrypto "github.com/Aryan-Protein-Vala/AetherNet/pkg/crypto"
 )
 
 const (
 	// DefaultWorkers is the number of concurrent upload goroutines.
 	DefaultWorkers = 5
 )
+
+// TransferOptions controls optional compression and encryption.
+type TransferOptions struct {
+	Compress   bool     // Apply LZ4 compression
+	Encrypt    bool     // Apply AES-256-GCM encryption
+	EncryptKey [32]byte // Encryption key (derived from passphrase)
+}
 
 // Shared HTTP client with connection pooling and sensible timeouts.
 var httpClient = &http.Client{
@@ -82,7 +92,11 @@ type TransferStats struct {
 // UploadPipelined consumes chunks from a PipelineInfo channel and
 // uploads them in parallel via HTTP POST. Uploads begin as soon as
 // the first chunk is produced — no waiting for the full file to be split.
-func UploadPipelined(pipe *chunker.PipelineInfo, targetURL string, numWorkers int) (*TransferStats, error) {
+// Options control optional LZ4 compression and AES-256-GCM encryption.
+func UploadPipelined(pipe *chunker.PipelineInfo, targetURL string, numWorkers int, opts *TransferOptions) (*TransferStats, error) {
+	if opts == nil {
+		opts = &TransferOptions{}
+	}
 	if numWorkers <= 0 {
 		numWorkers = DefaultWorkers
 	}
@@ -121,7 +135,7 @@ func UploadPipelined(pipe *chunker.PipelineInfo, targetURL string, numWorkers in
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				results <- processUpload(job, uploadURL)
+				results <- processUpload(job, uploadURL, opts)
 			}
 		}()
 	}
@@ -209,7 +223,7 @@ func Upload(manifest *chunker.FileManifest, cacheDir string, targetURL string, n
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				results <- processUpload(job, uploadURL)
+				results <- processUpload(job, uploadURL, nil)
 			}
 		}()
 	}
@@ -252,8 +266,10 @@ const (
 )
 
 // processUpload attempts to upload a chunk with retry and exponential backoff.
-// Each retry re-opens the file to reset the io.Reader position.
-func processUpload(job UploadJob, uploadURL string) UploadResult {
+func processUpload(job UploadJob, uploadURL string, opts *TransferOptions) UploadResult {
+	if opts == nil {
+		opts = &TransferOptions{}
+	}
 	start := time.Now()
 	result := UploadResult{ChunkID: job.Chunk.ID}
 
@@ -266,7 +282,7 @@ func processUpload(job UploadJob, uploadURL string) UploadResult {
 			backoff *= 2 // exponential: 100ms -> 200ms -> 400ms
 		}
 
-		lastErr = doUpload(job, uploadURL, &result)
+		lastErr = doUpload(job, uploadURL, &result, opts)
 		if lastErr == nil {
 			result.Success = true
 			result.Duration = time.Since(start)
@@ -281,28 +297,54 @@ func processUpload(job UploadJob, uploadURL string) UploadResult {
 }
 
 // doUpload performs a single upload attempt. Returns nil on success.
-func doUpload(job UploadJob, uploadURL string, result *UploadResult) error {
+func doUpload(job UploadJob, uploadURL string, result *UploadResult, opts *TransferOptions) error {
 	f, err := os.Open(job.ChunkPath)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
 	defer f.Close()
 
-	info, err := f.Stat()
+	data, err := io.ReadAll(f)
 	if err != nil {
-		return fmt.Errorf("stat: %w", err)
+		return fmt.Errorf("read: %w", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, uploadURL, f)
+	// Apply optional transforms: compress then encrypt
+	compressed := false
+	if opts.Compress {
+		transformed, beneficial := aecrypto.CompressLZ4(data)
+		if beneficial {
+			data = transformed
+			compressed = true
+		}
+	}
+	if opts.Encrypt {
+		enc, err := aecrypto.Encrypt(data, opts.EncryptKey)
+		if err != nil {
+			return fmt.Errorf("encrypt: %w", err)
+		}
+		data = enc
+	}
+
+	// Re-hash the transformed data for verification
+	transformedHash := sha256.Sum256(data)
+
+	req, err := http.NewRequest(http.MethodPost, uploadURL, bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("request: %w", err)
 	}
 
-	req.ContentLength = info.Size()
+	req.ContentLength = int64(len(data))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Aether-File-ID", job.FileID)
 	req.Header.Set("X-Aether-Chunk-ID", strconv.Itoa(int(job.Chunk.ID)))
-	req.Header.Set("X-Aether-Chunk-Hash", hex.EncodeToString(job.Chunk.Hash[:]))
+	req.Header.Set("X-Aether-Chunk-Hash", hex.EncodeToString(transformedHash[:]))
+	if compressed {
+		req.Header.Set("X-Aether-Compressed", "lz4")
+	}
+	if opts.Encrypt {
+		req.Header.Set("X-Aether-Encrypted", "aes-256-gcm")
+	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -315,6 +357,6 @@ func doUpload(job UploadJob, uploadURL string, result *UploadResult) error {
 		return fmt.Errorf("rejected: HTTP %d", resp.StatusCode)
 	}
 
-	result.BytesSent = uint32(info.Size())
+	result.BytesSent = uint32(len(data))
 	return nil
 }

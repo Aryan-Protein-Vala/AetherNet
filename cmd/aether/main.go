@@ -19,6 +19,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Aryan-Protein-Vala/AetherNet/pkg/chunker"
+	aecrypto "github.com/Aryan-Protein-Vala/AetherNet/pkg/crypto"
 	"github.com/Aryan-Protein-Vala/AetherNet/pkg/network"
 	"github.com/Aryan-Protein-Vala/AetherNet/pkg/receiver"
 )
@@ -65,6 +66,9 @@ func main() {
 	}
 	sendCmd.Flags().StringP("to", "t", DefaultRelayURL, "Relay server URL")
 	sendCmd.Flags().IntP("workers", "w", 5, "Parallel upload workers")
+	sendCmd.Flags().BoolP("compress", "z", false, "Enable LZ4 compression")
+	sendCmd.Flags().BoolP("encrypt", "e", false, "Enable AES-256-GCM encryption")
+	sendCmd.Flags().StringP("password", "k", "", "Encryption passphrase")
 	root.AddCommand(sendCmd)
 
 	// ── fetch ─────────────────────────────────────────────────────────
@@ -77,6 +81,7 @@ func main() {
 	fetchCmd.Flags().StringP("from", "f", DefaultRelayURL, "Relay server URL")
 	fetchCmd.Flags().StringP("out", "o", ".", "Output directory")
 	fetchCmd.Flags().IntP("workers", "w", 5, "Parallel download workers")
+	fetchCmd.Flags().StringP("password", "k", "", "Decryption passphrase")
 	root.AddCommand(fetchCmd)
 
 	// ── relay ─────────────────────────────────────────────────────────
@@ -101,6 +106,19 @@ func runSend(cmd *cobra.Command, args []string) error {
 	filePath := args[0]
 	targetURL, _ := cmd.Flags().GetString("to")
 	workers, _ := cmd.Flags().GetInt("workers")
+	compress, _ := cmd.Flags().GetBool("compress")
+	encrypt, _ := cmd.Flags().GetBool("encrypt")
+	password, _ := cmd.Flags().GetString("password")
+
+	if encrypt && password == "" {
+		printError("--encrypt requires --password")
+		return fmt.Errorf("encryption requires a passphrase")
+	}
+
+	opts := &network.TransferOptions{Compress: compress, Encrypt: encrypt}
+	if encrypt {
+		opts.EncryptKey = aecrypto.DeriveKey(password)
+	}
 
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
@@ -120,7 +138,13 @@ func runSend(cmd *cobra.Command, args []string) error {
 	printKV("Relay", targetURL)
 	printKV("Workers", fmt.Sprintf("%d goroutines", workers))
 	printKV("Hash", "SHA-256")
-	printKV("Mode", "pipelined (chunk + upload concurrent)")
+	if compress {
+		printKV("Compress", "LZ4")
+	}
+	if encrypt {
+		printKV("Encrypt", "AES-256-GCM")
+	}
+	printKV("Mode", "pipelined")
 	fmt.Println()
 
 	printStep("Chunking + uploading (pipelined)")
@@ -137,7 +161,7 @@ func runSend(cmd *cobra.Command, args []string) error {
 		formatBytes(int64(pipe.ChunkSize)),
 	)
 
-	stats, err := network.UploadPipelined(pipe, targetURL, workers)
+	stats, err := network.UploadPipelined(pipe, targetURL, workers, opts)
 	if err != nil {
 		printError("Transfer failed: %v", err)
 		return err
