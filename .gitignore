@@ -28,3 +28,6 @@ go.work
 .DS_Store
 Thumbs.db
 aether_100mb_test.bin
+.aether_received/
+.aether_cache/
+bin/

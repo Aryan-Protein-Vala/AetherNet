@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/fatih/color"
+	"github.com/quic-go/quic-go"
 	"github.com/spf13/cobra"
 
 	"github.com/Aryan-Protein-Vala/AetherNet/pkg/chunker"
@@ -69,6 +70,7 @@ func main() {
 	sendCmd.Flags().BoolP("compress", "z", false, "Enable LZ4 compression")
 	sendCmd.Flags().BoolP("encrypt", "e", false, "Enable AES-256-GCM encryption")
 	sendCmd.Flags().StringP("password", "k", "", "Encryption passphrase")
+	sendCmd.Flags().Bool("quic", false, "Use QUIC transport (UDP, zero HOL blocking)")
 	root.AddCommand(sendCmd)
 
 	// ── fetch ─────────────────────────────────────────────────────────
@@ -82,6 +84,7 @@ func main() {
 	fetchCmd.Flags().StringP("out", "o", ".", "Output directory")
 	fetchCmd.Flags().IntP("workers", "w", 5, "Parallel download workers")
 	fetchCmd.Flags().StringP("password", "k", "", "Decryption passphrase")
+	fetchCmd.Flags().Bool("quic", false, "Use QUIC transport")
 	root.AddCommand(fetchCmd)
 
 	// ── relay ─────────────────────────────────────────────────────────
@@ -90,7 +93,9 @@ func main() {
 		Short: "Start an Aether relay server",
 		RunE:  runRelay,
 	}
-	relayCmd.Flags().IntP("port", "p", 8080, "Port to listen on")
+	relayCmd.Flags().IntP("port", "p", 8080, "HTTP port to listen on")
+	relayCmd.Flags().Int("quic-port", 4242, "QUIC/UDP port to listen on")
+	relayCmd.Flags().Bool("quic", false, "Enable QUIC listener")
 	root.AddCommand(relayCmd)
 
 	if err := root.Execute(); err != nil {
@@ -109,6 +114,7 @@ func runSend(cmd *cobra.Command, args []string) error {
 	compress, _ := cmd.Flags().GetBool("compress")
 	encrypt, _ := cmd.Flags().GetBool("encrypt")
 	password, _ := cmd.Flags().GetString("password")
+	useQUIC, _ := cmd.Flags().GetBool("quic")
 
 	if encrypt && password == "" {
 		printError("--encrypt requires --password")
@@ -144,13 +150,18 @@ func runSend(cmd *cobra.Command, args []string) error {
 	if encrypt {
 		printKV("Encrypt", "AES-256-GCM")
 	}
-	printKV("Mode", "pipelined")
+	transport := "HTTP/1.1"
+	if useQUIC {
+		transport = "QUIC/UDP"
+	}
+	printKV("Transport", transport)
+	printKV("Mode", "mmap + parallel")
 	fmt.Println()
 
-	printStep("Chunking + uploading (pipelined)")
+	printStep("Chunking + uploading (mmap pipelined)")
 	totalStart := time.Now()
 
-	pipe, err := chunker.ChunkFilePipelined(absPath, 0)
+	pipe, err := chunker.ChunkFileFast(absPath, 0)
 	if err != nil {
 		printError("Pipeline init failed: %v", err)
 		return err
@@ -161,7 +172,20 @@ func runSend(cmd *cobra.Command, args []string) error {
 		formatBytes(int64(pipe.ChunkSize)),
 	)
 
-	stats, err := network.UploadPipelined(pipe, targetURL, workers, opts)
+	var stats *network.TransferStats
+	if useQUIC {
+		// For QUIC, convert URL to host:port address
+		quicAddr := strings.TrimPrefix(targetURL, "http://")
+		quicAddr = strings.TrimPrefix(quicAddr, "https://")
+		// Replace HTTP port with QUIC port (4242)
+		parts := strings.Split(quicAddr, ":")
+		if len(parts) >= 1 {
+			quicAddr = parts[0] + ":4242"
+		}
+		stats, err = network.UploadQUIC(pipe, quicAddr, workers, opts)
+	} else {
+		stats, err = network.UploadPipelined(pipe, targetURL, workers, opts)
+	}
 	if err != nil {
 		printError("Transfer failed: %v", err)
 		return err
@@ -230,6 +254,7 @@ func runFetch(cmd *cobra.Command, args []string) error {
 	outputDir, _ := cmd.Flags().GetString("out")
 	workers, _ := cmd.Flags().GetInt("workers")
 	password, _ := cmd.Flags().GetString("password")
+	useQUIC, _ := cmd.Flags().GetBool("quic")
 
 	// Build download options — encryption key provided by user if needed.
 	// Compress flag is auto-detected from the manifest on the relay.
@@ -255,7 +280,20 @@ func runFetch(cmd *cobra.Command, args []string) error {
 	printStep("Fetching manifest...")
 	totalStart := time.Now()
 
-	manifest, dlStats, err := network.DownloadPipelined(fileID, relayURL, workers, opts)
+	var manifest *network.RelayManifest
+	var dlStats *network.DownloadStats
+	var err error
+	if useQUIC {
+		quicAddr := strings.TrimPrefix(relayURL, "http://")
+		quicAddr = strings.TrimPrefix(quicAddr, "https://")
+		parts := strings.Split(quicAddr, ":")
+		if len(parts) >= 1 {
+			quicAddr = parts[0] + ":4242"
+		}
+		manifest, dlStats, err = network.DownloadQUIC(fileID, quicAddr, workers, opts)
+	} else {
+		manifest, dlStats, err = network.DownloadPipelined(fileID, relayURL, workers, opts)
+	}
 	if err != nil {
 		printError("Download failed: %v", err)
 		return err
@@ -325,7 +363,24 @@ func runFetch(cmd *cobra.Command, args []string) error {
 
 func runRelay(cmd *cobra.Command, args []string) error {
 	port, _ := cmd.Flags().GetInt("port")
+	enableQUIC, _ := cmd.Flags().GetBool("quic")
+	quicPort, _ := cmd.Flags().GetInt("quic-port")
+
 	srv := receiver.New(port)
+
+	if enableQUIC {
+		tlsConf := network.InsecureTLSConfig()
+		quicAddr := fmt.Sprintf(":%d", quicPort)
+		listener, err := quic.ListenAddr(quicAddr, tlsConf, &quic.Config{
+			MaxIdleTimeout: 30 * time.Second,
+			Allow0RTT:      true,
+		})
+		if err != nil {
+			return fmt.Errorf("quic listen: %w", err)
+		}
+		go srv.StartQUICWithConfig(quicAddr, listener)
+	}
+
 	return srv.Start()
 }
 
