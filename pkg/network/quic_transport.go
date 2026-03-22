@@ -36,8 +36,9 @@ func UploadQUIC(pipe *chunker.PipelineInfo, relayAddr string, numWorkers int, op
 	}
 
 	conn, err := quic.DialAddr(context.Background(), relayAddr, tlsConf, &quic.Config{
-		MaxIdleTimeout: 30 * time.Second,
-		Allow0RTT:      true,
+		MaxIdleTimeout:          30 * time.Second,
+		Allow0RTT:               true,
+		DisablePathMTUDiscovery: true, // Bypass Tailscale WireGuard MTU fragmentation limits
 	})
 	if err != nil {
 		return nil, fmt.Errorf("quic dial: %w", err)
@@ -212,8 +213,9 @@ func DownloadQUIC(fileID string, relayAddr string, numWorkers int, opts *Transfe
 	}
 
 	conn, err := quic.DialAddr(context.Background(), relayAddr, tlsConf, &quic.Config{
-		MaxIdleTimeout: 30 * time.Second,
-		Allow0RTT:      true,
+		MaxIdleTimeout:          30 * time.Second,
+		Allow0RTT:               true,
+		DisablePathMTUDiscovery: true, // Bypass Tailscale WireGuard MTU fragmentation limits
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("quic dial: %w", err)

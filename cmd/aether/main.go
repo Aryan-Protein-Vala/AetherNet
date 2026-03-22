@@ -372,8 +372,9 @@ func runRelay(cmd *cobra.Command, args []string) error {
 		tlsConf := network.InsecureTLSConfig()
 		quicAddr := fmt.Sprintf("0.0.0.0:%d", quicPort)
 		listener, err := quic.ListenAddr(quicAddr, tlsConf, &quic.Config{
-			MaxIdleTimeout: 30 * time.Second,
-			Allow0RTT:      true,
+			MaxIdleTimeout:          30 * time.Second,
+			Allow0RTT:               true,
+			DisablePathMTUDiscovery: true, // Bypass Tailscale WireGuard MTU fragmentation limits
 		})
 		if err != nil {
 			return fmt.Errorf("quic listen: %w", err)
