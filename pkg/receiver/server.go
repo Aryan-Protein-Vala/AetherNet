@@ -26,6 +26,8 @@ import (
 	"time"
 
 	"github.com/fatih/color"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 const (
@@ -62,9 +64,13 @@ func (s *Server) Start() error {
 	addr := fmt.Sprintf(":%d", s.Port)
 	printBanner(s.Port)
 
+	h2s := &http2.Server{
+		MaxConcurrentStreams: 500,
+	}
+
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           s.mux,
+		Handler:           h2c.NewHandler(s.mux, h2s),
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      120 * time.Second,
 		IdleTimeout:       120 * time.Second,

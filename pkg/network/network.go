@@ -13,7 +13,9 @@ package network
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -26,6 +28,7 @@ import (
 	"time"
 
 	"github.com/schollz/progressbar/v3"
+	"golang.org/x/net/http2"
 
 	"github.com/Aryan-Protein-Vala/AetherNet/pkg/chunker"
 	aecrypto "github.com/Aryan-Protein-Vala/AetherNet/pkg/crypto"
@@ -46,17 +49,14 @@ type TransferOptions struct {
 // Shared HTTP client with connection pooling and sensible timeouts.
 var httpClient = &http.Client{
 	Timeout: 60 * time.Second,
-	Transport: &http.Transport{
-		MaxIdleConns:        20,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
-		DialContext: (&net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		DisableCompression: true,
-		WriteBufferSize:    256 << 10,
-		ReadBufferSize:     64 << 10,
+	Transport: &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+			var d net.Dialer
+			d.Timeout = 5 * time.Second
+			d.KeepAlive = 30 * time.Second
+			return d.DialContext(ctx, network, addr)
+		},
 	},
 }
 
@@ -65,6 +65,8 @@ type UploadJob struct {
 	Chunk     chunker.Chunk
 	ChunkPath string
 	FileID    string
+	Data      []byte
+	BufferPtr *[]byte
 }
 
 // UploadResult is sent back by a worker after processing a job.
@@ -153,6 +155,8 @@ func UploadPipelined(pipe *chunker.PipelineInfo, targetURL string, numWorkers in
 				Chunk:     cr.Chunk,
 				ChunkPath: cr.ChunkPath,
 				FileID:    pipe.FileIDHex,
+				Data:      cr.Data,
+				BufferPtr: cr.BufferPtr,
 			}
 		}
 		close(jobs)
@@ -267,6 +271,13 @@ const (
 
 // processUpload attempts to upload a chunk with retry and exponential backoff.
 func processUpload(job UploadJob, uploadURL string, opts *TransferOptions) UploadResult {
+	// CRITICAL: Return the underlying array to the pool when fully finished
+	defer func() {
+		if job.BufferPtr != nil {
+			chunker.ChunkPool.Put(job.BufferPtr)
+		}
+	}()
+
 	if opts == nil {
 		opts = &TransferOptions{}
 	}
@@ -296,17 +307,24 @@ func processUpload(job UploadJob, uploadURL string, opts *TransferOptions) Uploa
 	return result
 }
 
-// doUpload performs a single upload attempt. Returns nil on success.
 func doUpload(job UploadJob, uploadURL string, result *UploadResult, opts *TransferOptions) error {
-	f, err := os.Open(job.ChunkPath)
-	if err != nil {
-		return fmt.Errorf("open: %w", err)
-	}
-	defer f.Close()
+	var data []byte
+	var err error
 
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return fmt.Errorf("read: %w", err)
+	if job.Data != nil {
+		data = job.Data
+	} else {
+		// Fallback for legacy batch mode
+		f, err := os.Open(job.ChunkPath)
+		if err != nil {
+			return fmt.Errorf("open: %w", err)
+		}
+		defer f.Close()
+
+		data, err = io.ReadAll(f)
+		if err != nil {
+			return fmt.Errorf("read: %w", err)
+		}
 	}
 
 	// Apply optional transforms: compress then encrypt

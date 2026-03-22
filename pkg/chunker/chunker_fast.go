@@ -74,13 +74,6 @@ func ChunkFileFast(filePath string, chunkSize uint32) (*PipelineInfo, error) {
 	}
 	fileIDHex := hex.EncodeToString(fileID[:])
 
-	sessionDir := filepath.Join(cacheDir, fileIDHex)
-	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
-		syscall.Munmap(data)
-		f.Close()
-		return nil, fmt.Errorf("mkdir: %w", err)
-	}
-
 	numChunks := int(fileSize / int64(chunkSize))
 	if fileSize%int64(chunkSize) != 0 || fileSize == 0 {
 		numChunks++
@@ -126,7 +119,7 @@ func ChunkFileFast(filePath string, chunkSize uint32) (*PipelineInfo, error) {
 			wg.Add(1)
 			go func(start, end int) {
 				defer wg.Done()
-				processSegment(data, fileSize, chunkSize, sessionDir, start, end, chunkCh)
+				processSegment(data, fileSize, chunkSize, start, end, chunkCh)
 			}(startChunk, endChunk)
 
 			startChunk = endChunk
@@ -138,9 +131,9 @@ func ChunkFileFast(filePath string, chunkSize uint32) (*PipelineInfo, error) {
 	return pipeline, nil
 }
 
-// processSegment hashes and writes chunks [start, end) from the mmap'd data.
+// processSegment hashes chunks [start, end) from the mmap'd data.
 func processSegment(data []byte, fileSize int64, chunkSize uint32,
-	sessionDir string, startChunk, endChunk int, out chan<- ChunkResult) {
+	startChunk, endChunk int, out chan<- ChunkResult) {
 
 	for i := startChunk; i < endChunk; i++ {
 		offset := int64(i) * int64(chunkSize)
@@ -150,13 +143,13 @@ func processSegment(data []byte, fileSize int64, chunkSize uint32,
 		}
 
 		slice := data[offset:end]
-		chunkHash := sha256.Sum256(slice)
-
-		chunkPath := filepath.Join(sessionDir, fmt.Sprintf("%06d.chunk", i))
-		if err := writeChunkFile(chunkPath, slice); err != nil {
-			out <- ChunkResult{Err: fmt.Errorf("write chunk %d: %w", i, err)}
-			return
-		}
+		
+		// Get a pooled buffer to avoid heap allocations and disk bouncing
+		bufPtr := ChunkPool.Get().(*[]byte)
+		buf := (*bufPtr)[:int(end-offset)]
+		copy(buf, slice)
+		
+		chunkHash := sha256.Sum256(buf)
 
 		out <- ChunkResult{
 			Chunk: Chunk{
@@ -166,7 +159,8 @@ func processSegment(data []byte, fileSize int64, chunkSize uint32,
 				Hash:   chunkHash,
 				State:  ChunkPending,
 			},
-			ChunkPath: chunkPath,
+			Data:      buf,
+			BufferPtr: bufPtr,
 		}
 	}
 }

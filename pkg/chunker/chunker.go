@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -27,10 +28,21 @@ const (
 	cacheDir = ".aether_cache"
 )
 
+// ChunkPool recycles 2MB memory buffers for zero-disk pipelining.
+// We allocate DefaultChunkSize + 1024 bytes (for encryption/compression padding).
+var ChunkPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, DefaultChunkSize+1024)
+		return &b
+	},
+}
+
 // ChunkResult is emitted on the pipeline channel for each chunk produced.
 type ChunkResult struct {
 	Chunk     Chunk
 	ChunkPath string
+	Data      []byte  // In-memory data
+	BufferPtr *[]byte // Pointer to return to ChunkPool
 	Err       error
 }
 
@@ -84,11 +96,7 @@ func ChunkFilePipelined(filePath string, chunkSize uint32) (*PipelineInfo, error
 		return nil, fmt.Errorf("generate file ID: %w", err)
 	}
 
-	sessionDir := filepath.Join(cacheDir, hex.EncodeToString(fileID[:]))
-	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("create cache dir: %w", err)
-	}
+	fileIDHex := hex.EncodeToString(fileID[:])
 
 	numChunks := int(fileSize / int64(chunkSize))
 	if fileSize%int64(chunkSize) != 0 || fileSize == 0 {
@@ -99,7 +107,7 @@ func ChunkFilePipelined(filePath string, chunkSize uint32) (*PipelineInfo, error
 
 	pipeline := &PipelineInfo{
 		FileID:      fileID,
-		FileIDHex:   hex.EncodeToString(fileID[:]),
+		FileIDHex:   fileIDHex,
 		FileName:    filepath.Base(filePath),
 		FileSize:    fileSize,
 		ChunkSize:   chunkSize,
@@ -123,11 +131,9 @@ func ChunkFilePipelined(filePath string, chunkSize uint32) (*PipelineInfo, error
 			if n > 0 {
 				chunkHash := sha256.Sum256(buf[:n])
 
-				chunkPath := filepath.Join(sessionDir, fmt.Sprintf("%06d.chunk", chunkID))
-				if err := writeChunkFile(chunkPath, buf[:n]); err != nil {
-					chunkCh <- ChunkResult{Err: fmt.Errorf("write chunk %d: %w", chunkID, err)}
-					return
-				}
+				bufPtr := ChunkPool.Get().(*[]byte)
+				dataBuf := (*bufPtr)[:n]
+				copy(dataBuf, buf[:n])
 
 				chunkCh <- ChunkResult{
 					Chunk: Chunk{
@@ -137,7 +143,8 @@ func ChunkFilePipelined(filePath string, chunkSize uint32) (*PipelineInfo, error
 						Hash:   chunkHash,
 						State:  ChunkPending,
 					},
-					ChunkPath: chunkPath,
+					Data:      dataBuf,
+					BufferPtr: bufPtr,
 				}
 
 				offset += int64(n)

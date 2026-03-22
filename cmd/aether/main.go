@@ -150,7 +150,7 @@ func runSend(cmd *cobra.Command, args []string) error {
 	if encrypt {
 		printKV("Encrypt", "AES-256-GCM")
 	}
-	transport := "HTTP/1.1"
+	transport := "HTTP/2 (h2c)"
 	if useQUIC {
 		transport = "QUIC/UDP"
 	}

@@ -126,11 +126,24 @@ func UploadQUIC(pipe *chunker.PipelineInfo, relayAddr string, numWorkers int, op
 func uploadChunkQUIC(conn *quic.Conn, cr chunker.ChunkResult, fileID string, opts *TransferOptions) UploadResult {
 	start := time.Now()
 	result := UploadResult{ChunkID: cr.Chunk.ID}
+	// CRITICAL: Return the underlying array to the pool when fully finished
+	defer func() {
+		if cr.BufferPtr != nil {
+			chunker.ChunkPool.Put(cr.BufferPtr)
+		}
+	}()
 
-	data, err := os.ReadFile(cr.ChunkPath)
-	if err != nil {
-		result.Err = err
-		return result
+	var data []byte
+	if cr.Data != nil {
+		data = cr.Data
+	} else {
+		// Fallback for legacy batch mode
+		var err error
+		data, err = os.ReadFile(cr.ChunkPath)
+		if err != nil {
+			result.Err = err
+			return result
+		}
 	}
 
 	if opts.Compress {
