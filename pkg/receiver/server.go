@@ -56,6 +56,7 @@ func New(port int) *Server {
 	s.mux.HandleFunc("/manifest", s.handleManifest)
 	s.mux.HandleFunc("/chunk", s.handleGetChunk)
 	s.mux.HandleFunc("/health", s.handleHealth)
+	s.mux.HandleFunc("/download-cli", s.handleDownloadCLI)
 	return s
 }
 
@@ -78,6 +79,14 @@ func (s *Server) Start() error {
 	}
 
 	return server.ListenAndServe()
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// GET /download-cli — serve the aether binary
+// ──────────────────────────────────────────────────────────────────────
+
+func (s *Server) handleDownloadCLI(w http.ResponseWriter, r *http.Request) {
+	http.ServeFile(w, r, "bin/aether")
 }
 
 // ──────────────────────────────────────────────────────────────────────

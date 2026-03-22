@@ -29,10 +29,10 @@ const (
 )
 
 // ChunkPool recycles 2MB memory buffers for zero-disk pipelining.
-// We allocate DefaultChunkSize + 1024 bytes (for encryption/compression padding).
+// We allocate MaxChunkSize + 1024 bytes (for encryption/compression padding).
 var ChunkPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, DefaultChunkSize+1024)
+		b := make([]byte, MaxChunkSize+1024)
 		return &b
 	},
 }

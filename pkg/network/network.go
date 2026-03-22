@@ -46,16 +46,45 @@ type TransferOptions struct {
 	EncryptKey [32]byte // Encryption key (derived from passphrase)
 }
 
+// dualTransport smoothly routes between cleartext HTTP/2 (h2c) for local relays,
+// and TLS HTTP/2 for public Cloudflare tunnels.
+type dualTransport struct {
+	h2c *http2.Transport
+	std *http.Transport
+}
+
+func (t *dualTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Scheme == "https" {
+		return t.std.RoundTrip(req)
+	}
+	return t.h2c.RoundTrip(req)
+}
+
 // Shared HTTP client with connection pooling and sensible timeouts.
 var httpClient = &http.Client{
 	Timeout: 60 * time.Second,
-	Transport: &http2.Transport{
-		AllowHTTP: true,
-		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-			var d net.Dialer
-			d.Timeout = 5 * time.Second
-			d.KeepAlive = 30 * time.Second
-			return d.DialContext(ctx, network, addr)
+	Transport: &dualTransport{
+		h2c: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+				var d net.Dialer
+				d.Timeout = 5 * time.Second
+				d.KeepAlive = 30 * time.Second
+				return d.DialContext(ctx, network, addr)
+			},
+		},
+		std: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100,
+			IdleConnTimeout:     90 * time.Second,
+			DialContext: (&net.Dialer{
+				Timeout:   5 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:  true,
+			DisableCompression: true,
+			WriteBufferSize:    256 << 10,
+			ReadBufferSize:     64 << 10,
 		},
 	},
 }
