@@ -8,7 +8,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -379,16 +378,7 @@ func runFetch(cmd *cobra.Command, args []string) error {
 								return
 							}
 
-							// Write manifest.json so ReassembleFromCache can resolve filename
-							cacheDir := filepath.Join(".aether_cache", manifest.FileID)
-							manifestJSON, _ := json.Marshal(manifest)
-							os.WriteFile(filepath.Join(cacheDir, "manifest.json"), manifestJSON, 0o644)
-
-							outPath, reassembleErr := receiver.ReassembleFromCache(manifest.FileID, outputDir)
-							if reassembleErr != nil {
-								printError("Reassemble failed: %v", reassembleErr)
-								return
-							}
+							outPath := filepath.Join(outputDir, manifest.FileName)
 
 							fmt.Println()
 							printDivider()

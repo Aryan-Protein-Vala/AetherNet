@@ -28,13 +28,13 @@ type RelayManifest struct {
 	Encrypted   bool   `json:"encrypted"`
 }
 
-// DownloadResult is sent back by a download worker.
 type DownloadResult struct {
 	ChunkID   int
 	Success   bool
 	BytesRecv int64
 	Err       error
 	Duration  time.Duration
+	EOF       bool
 }
 
 // DownloadStats holds aggregate download metrics.

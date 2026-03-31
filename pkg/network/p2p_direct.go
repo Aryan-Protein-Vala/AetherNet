@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -103,16 +104,28 @@ func UploadDirectQUIC(pipe *chunker.PipelineInfo, targetIP string, numWorkers in
 		progressbar.OptionOnCompletion(func() { fmt.Println() }),
 	)
 
+	var streams []*quic.Stream
+	for w := 0; w < numWorkers; w++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		stream, err := conn.OpenStreamSync(ctx)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("open worker stream: %w", err)
+		}
+		streams = append(streams, stream)
+	}
+
 	var wg sync.WaitGroup
 	for w := 0; w < numWorkers; w++ {
 		wg.Add(1)
-		go func(workerID int) {
+		go func(workerID int, stream *quic.Stream) {
 			defer wg.Done()
+			defer (*stream).Close()
 			for cr := range jobs {
-				res := p2pUploadChunk(conn, cr, pipe.FileIDHex, opts)
+				res := p2pUploadChunk(stream, cr, pipe.FileIDHex, opts)
 				results <- res
 			}
-		}(w)
+		}(w, streams[w])
 	}
 
 	var pipeErr error
@@ -151,7 +164,7 @@ func UploadDirectQUIC(pipe *chunker.PipelineInfo, targetIP string, numWorkers in
 
 // p2pUploadChunk sends a single chunk over a dedicated QUIC stream.
 // The receiver reads the header+data, verifies the hash, and sends a 1-byte ACK.
-func p2pUploadChunk(conn *quic.Conn, cr chunker.ChunkResult, fileID string, opts *TransferOptions) UploadResult {
+func p2pUploadChunk(stream *quic.Stream, cr chunker.ChunkResult, fileID string, opts *TransferOptions) UploadResult {
 	start := time.Now()
 	result := UploadResult{ChunkID: cr.Chunk.ID}
 
@@ -198,23 +211,19 @@ func p2pUploadChunk(conn *quic.Conn, cr chunker.ChunkResult, fileID string, opts
 	frame.Write(hash[:])
 	frame.Write(data)
 
-	// Open a new bidirectional stream for this chunk
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	stream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		result.Err = fmt.Errorf("open stream: %w", err)
+	frameBytes := frame.Bytes()
+	lengthPrefix := make([]byte, 4)
+	binary.BigEndian.PutUint32(lengthPrefix, uint32(len(frameBytes)))
+
+	// Write length prefix then frame
+	if _, err := (*stream).Write(lengthPrefix); err != nil {
+		result.Err = fmt.Errorf("write length prefix: %w", err)
 		return result
 	}
-
-	// Write entire frame at once
-	if _, err := stream.Write(frame.Bytes()); err != nil {
+	if _, err := (*stream).Write(frameBytes); err != nil {
 		result.Err = fmt.Errorf("write chunk: %w", err)
 		return result
 	}
-
-	// Close write direction — signals to receiver that data is complete
-	stream.Close()
 
 	// Wait for 1-byte ACK from receiver
 	ack := make([]byte, 1)
@@ -304,11 +313,25 @@ func ListenDirectQUIC(expectedFileID string, outputDir string, opts *TransferOpt
 	opts.Compress = manifest.Compressed
 	opts.Encrypt = manifest.Encrypted && opts.Encrypt
 
-	cacheDir := filepath.Join(".aether_cache", manifest.FileID)
-	os.MkdirAll(cacheDir, 0o755)
+	finalPath := filepath.Join(outputDir, manifest.FileName)
+	f, err := os.OpenFile(finalPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create output file: %w", err)
+	}
+	defer f.Close()
+
+	if err := f.Truncate(manifest.FileSize); err != nil {
+		return nil, nil, fmt.Errorf("truncate file: %w", err)
+	}
+
+	mmapData, err := syscall.Mmap(int(f.Fd()), 0, int(manifest.FileSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		return nil, nil, fmt.Errorf("mmap file: %w", err)
+	}
+	defer syscall.Munmap(mmapData)
 
 	totalChunks := manifest.TotalChunks
-	log.Printf("[P2P] Receiving %d chunks for file %s", totalChunks, manifest.FileName)
+	log.Printf("[P2P] Receiving %d chunks for file %s (mmap)", totalChunks, manifest.FileName)
 
 	bar := progressbar.NewOptions(totalChunks,
 		progressbar.OptionSetDescription("  ⚡ P2P Direct Download"),
@@ -324,60 +347,74 @@ func ListenDirectQUIC(expectedFileID string, outputDir string, opts *TransferOpt
 
 	stats := &DownloadStats{TotalChunks: totalChunks}
 
-	var wg sync.WaitGroup
+	var chunkWg sync.WaitGroup
 	var statsMu sync.Mutex
 
-	// Accept chunk streams in parallel!
-	for i := 0; i < totalChunks; i++ {
-		stream, err := conn.AcceptStream(context.Background())
-		if err != nil {
-			log.Printf("[P2P-RX] accept stream %d err: %v", i, err)
-			statsMu.Lock()
-			stats.FailCount++
-			statsMu.Unlock()
-			continue
-		}
+	chunkWg.Add(totalChunks)
 
-		wg.Add(1)
-		go func(s *quic.Stream) {
-			defer wg.Done()
-			res := p2pReceiveChunk(s, cacheDir, opts)
-			
-			statsMu.Lock()
-			if res.Success {
-				stats.SuccessCount++
-				stats.TotalBytes += res.BytesRecv
-			} else {
-				stats.FailCount++
-				log.Printf("[P2P-RX] chunk %d failed: %v", res.ChunkID, res.Err)
+	go func() {
+		for {
+			stream, err := conn.AcceptStream(context.Background())
+			if err != nil {
+				break
 			}
-			_ = bar.Add(1)
-			statsMu.Unlock()
-		}(stream)
-	}
 
-	wg.Wait() // Wait for all parallel chunks to finish
+			go func(s *quic.Stream) {
+				for {
+					res := p2pReceiveChunk(s, mmapData, manifest.ChunkSize, opts)
+					if res.EOF {
+						return
+					}
 
+					statsMu.Lock()
+					if res.Success {
+						stats.SuccessCount++
+						stats.TotalBytes += res.BytesRecv
+					} else {
+						stats.FailCount++
+						log.Printf("[P2P-RX] chunk %d failed: %v", res.ChunkID, res.Err)
+					}
+					_ = bar.Add(1)
+					statsMu.Unlock()
+					chunkWg.Done()
+				}
+			}(stream)
+		}
+	}()
+
+	chunkWg.Wait() // Wait for all parallel chunks to finish
 	return &manifest, stats, nil
 }
 
-// p2pReceiveChunk reads a single chunk from a QUIC stream (P2P direct).
-func p2pReceiveChunk(stream *quic.Stream, cacheDir string, opts *TransferOptions) DownloadResult {
+// p2pReceiveChunk reads a single chunk from a multiplexed QUIC stream.
+func p2pReceiveChunk(stream *quic.Stream, mmapData []byte, chunkSize uint32, opts *TransferOptions) DownloadResult {
 	start := time.Now()
 	result := DownloadResult{}
+
+	// Read frame length
+	lenBuf := make([]byte, 4)
+	n, err := io.ReadFull(stream, lenBuf)
+	if err != nil {
+		if err == io.EOF && n == 0 {
+			result.EOF = true
+			return result
+		}
+		result.Err = fmt.Errorf("read frame len: %w", err)
+		return result
+	}
+	frameLen := binary.BigEndian.Uint32(lenBuf)
 
 	// Grab memory from pool to avoid Garbage Collection panics
 	bufPtr := chunker.ChunkPool.Get().(*[]byte)
 	defer chunker.ChunkPool.Put(bufPtr)
 	
 	// Read directly into the pre-allocated pool buffer
-	buf := *bufPtr
-	n, err := io.ReadFull(stream, buf)
-	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+	buf := (*bufPtr)[:frameLen]
+	if _, err := io.ReadFull(stream, buf); err != nil {
 		result.Err = fmt.Errorf("read stream: %w", err)
 		return result
 	}
-	allData := buf[:n]
+	allData := buf
 
 	if len(allData) < 39 { 
 		result.Err = fmt.Errorf("frame too short (%d bytes)", len(allData))
@@ -429,12 +466,12 @@ func p2pReceiveChunk(stream *quic.Stream, cacheDir string, opts *TransferOptions
 		data = dec
 	}
 
-	// Write to cache
-	chunkPath := filepath.Join(cacheDir, fmt.Sprintf("%06d.chunk", chunkID))
-	if err := os.WriteFile(chunkPath, data, 0o644); err != nil {
-		result.Err = err
-		return result
-	}
+	// Write directly to mmap memory (0 copy to disk!)
+	offset := int64(chunkID) * int64(chunkSize)
+	copy(mmapData[offset:offset+int64(len(data))], data)
+
+	// Send ACK (important: sender is waiting for it)
+	(*stream).Write([]byte{1})
 
 	result.Success = true
 	result.BytesRecv = int64(len(data))
