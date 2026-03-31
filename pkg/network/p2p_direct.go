@@ -324,25 +324,39 @@ func ListenDirectQUIC(expectedFileID string, outputDir string, opts *TransferOpt
 
 	stats := &DownloadStats{TotalChunks: totalChunks}
 
-	// Accept chunk streams until we have all chunks
+	var wg sync.WaitGroup
+	var statsMu sync.Mutex
+
+	// Accept chunk streams in parallel!
 	for i := 0; i < totalChunks; i++ {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
 			log.Printf("[P2P-RX] accept stream %d err: %v", i, err)
+			statsMu.Lock()
 			stats.FailCount++
+			statsMu.Unlock()
 			continue
 		}
 
-		res := p2pReceiveChunk(stream, cacheDir, opts)
-		if res.Success {
-			stats.SuccessCount++
-			stats.TotalBytes += res.BytesRecv
-		} else {
-			stats.FailCount++
-			log.Printf("[P2P-RX] chunk %d failed: %v", res.ChunkID, res.Err)
-		}
-		_ = bar.Add(1)
+		wg.Add(1)
+		go func(s *quic.Stream) {
+			defer wg.Done()
+			res := p2pReceiveChunk(s, cacheDir, opts)
+			
+			statsMu.Lock()
+			if res.Success {
+				stats.SuccessCount++
+				stats.TotalBytes += res.BytesRecv
+			} else {
+				stats.FailCount++
+				log.Printf("[P2P-RX] chunk %d failed: %v", res.ChunkID, res.Err)
+			}
+			_ = bar.Add(1)
+			statsMu.Unlock()
+		}(stream)
 	}
+
+	wg.Wait() // Wait for all parallel chunks to finish
 
 	return &manifest, stats, nil
 }
@@ -352,14 +366,20 @@ func p2pReceiveChunk(stream *quic.Stream, cacheDir string, opts *TransferOptions
 	start := time.Now()
 	result := DownloadResult{}
 
-	allData, err := io.ReadAll(stream)
-	if err != nil {
+	// Grab memory from pool to avoid Garbage Collection panics
+	bufPtr := chunker.ChunkPool.Get().(*[]byte)
+	defer chunker.ChunkPool.Put(bufPtr)
+	
+	// Read directly into the pre-allocated pool buffer
+	buf := *bufPtr
+	n, err := io.ReadFull(stream, buf)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 		result.Err = fmt.Errorf("read stream: %w", err)
 		return result
 	}
+	allData := buf[:n]
 
-	// Frame: [type=1] [fileID_len] [fileID] [chunkID_u32] [hash_32] [data]
-	if len(allData) < 39 { // minimum: 1 + 1 + 1 + 4 + 32
+	if len(allData) < 39 { 
 		result.Err = fmt.Errorf("frame too short (%d bytes)", len(allData))
 		return result
 	}

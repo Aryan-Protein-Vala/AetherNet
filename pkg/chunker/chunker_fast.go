@@ -131,7 +131,6 @@ func ChunkFileFast(filePath string, chunkSize uint32) (*PipelineInfo, error) {
 	return pipeline, nil
 }
 
-// processSegment hashes chunks [start, end) from the mmap'd data.
 func processSegment(data []byte, fileSize int64, chunkSize uint32,
 	startChunk, endChunk int, out chan<- ChunkResult) {
 
@@ -144,7 +143,7 @@ func processSegment(data []byte, fileSize int64, chunkSize uint32,
 
 		slice := data[offset:end]
 		
-		// Get a pooled buffer to avoid heap allocations and disk bouncing
+		// Grab RAM from the pool, NO DISK WRITES!
 		bufPtr := ChunkPool.Get().(*[]byte)
 		buf := (*bufPtr)[:int(end-offset)]
 		copy(buf, slice)
