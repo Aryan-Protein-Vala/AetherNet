@@ -164,7 +164,40 @@ func runSend(cmd *cobra.Command, args []string) error {
 	// ── P2P Direct Send Mode ─────────────────────────────────────────
 	toPeer, _ := cmd.Flags().GetString("to-peer")
 	if toPeer != "" {
-		printStep("Connecting to P2P Signaling Hub...")
+		printStep(fmt.Sprintf("Scanning local network for %s via Apple AirDrop (mDNS)...", toPeer))
+		localPeers, _ := network.DiscoverLocalPeers(2 * time.Second)
+		if localIP, found := localPeers[toPeer]; found {
+			printSuccess("Peer %s discovered locally at %s!", toPeer, localIP)
+			
+			printStep("Chunking file...")
+			totalStart := time.Now()
+			pipe, err := chunker.ChunkFileFast(absPath, 0)
+			if err != nil {
+				printError("Pipeline init failed: %v", err)
+				return err
+			}
+			
+			printStep(fmt.Sprintf("Uploading directly to %s via raw TCP...", localIP))
+			stats, err := network.UploadDirectTCP(pipe, localIP, workers, opts)
+			if err != nil {
+				printError("TCP transfer failed: %v", err)
+				return err
+			}
+
+			totalDur := time.Since(totalStart)
+			fmt.Println()
+			printDivider()
+			fmt.Printf("\n  %s P2P Direct Transfer complete (Raw TCP/mDNS Mode)\n\n", greenC("✓"))
+			mbPerSec := float64(stats.TotalBytes) / (1024 * 1024) / totalDur.Seconds()
+			printKV("Chunks", fmt.Sprintf("%d/%d %s", stats.SuccessCount, stats.TotalChunks, dimC("verified")))
+			printKV("Transferred", formatBytes(stats.TotalBytes))
+			printKV("Total Time", boldC(formatDuration(totalDur)))
+			printKV("Throughput", fmt.Sprintf("%s %s", magC(fmt.Sprintf("%.2f MB/s", mbPerSec)), dimC("(avg)")))
+			fmt.Println()
+			return nil
+		}
+
+		printStep("Peer not found locally. Connecting to P2P Signaling Hub...")
 		sigClient, err := network.ConnectSignaling(targetURL)
 		if err != nil {
 			printError("P2P Signaling failed: %v", err)
@@ -353,6 +386,33 @@ func runFetch(cmd *cobra.Command, args []string) error {
 			printError("P2P Signaling connection failed: %v", sigErr)
 		} else {
 			printSuccess("Connected to P2P Hub as %s — waiting for direct transfers...", sigClient.ClientID)
+
+			// Start mDNS
+			_, err := network.StartMDNSAdvertiser(sigClient.ClientID, network.DirectTCPPort)
+			if err != nil {
+				printError("mDNS Advertiser failed to start: %v", err)
+			} else {
+				printSuccess("Broadcasting AirDrop mDNS presence on local network!")
+			}
+
+			// Launch Direct TCP listener loop
+			go func() {
+				for {
+					manifest, dlStats, err := network.ListenDirectTCP("", outputDir, opts)
+					if err != nil {
+						time.Sleep(1 * time.Second)
+						continue
+					}
+					outPath := filepath.Join(outputDir, manifest.FileName)
+					fmt.Println()
+					printDivider()
+					fmt.Printf("\n  %s P2P Direct TCP Download complete\n\n", greenC("✓"))
+					printKV("Chunks", fmt.Sprintf("%d/%d %s", dlStats.SuccessCount, dlStats.TotalChunks, dimC("verified")))
+					printKV("Downloaded", formatBytes(dlStats.TotalBytes))
+					printKV("Output", boldC(outPath))
+					fmt.Println()
+				}
+			}()
 
 			// Listen for incoming connect_request messages and auto-accept
 			go func() {

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -469,6 +470,395 @@ func p2pReceiveChunk(stream *quic.Stream, mmapData []byte, chunkSize uint32, opt
 
 	// Send ACK (important: sender is waiting for it)
 	(*stream).Write([]byte{1})
+
+	result.Success = true
+	result.BytesRecv = int64(len(data))
+	result.Duration = time.Since(start)
+	return result
+}
+
+const DirectTCPPort = 4243
+
+// ──────────────────────────────────────────────────────────────────────
+// UploadDirectTCP — send chunks over Raw TCP
+// ──────────────────────────────────────────────────────────────────────
+
+func UploadDirectTCP(pipe *chunker.PipelineInfo, targetIP string, numWorkers int, opts *TransferOptions) (*TransferStats, error) {
+	if opts == nil {
+		opts = &TransferOptions{}
+	}
+	if numWorkers <= 0 {
+		numWorkers = DefaultWorkers
+	}
+
+	targetAddr := fmt.Sprintf("%s:%d", targetIP, DirectTCPPort)
+	log.Printf("[P2P-TCP] Dialing peer at %s ...", targetAddr)
+
+	var conns []net.Conn
+	for w := 0; w < numWorkers; w++ {
+		c, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
+		if err != nil {
+			return nil, fmt.Errorf("tcp dial %s: %w", targetAddr, err)
+		}
+		conns = append(conns, c)
+	}
+	log.Printf("[P2P-TCP] Connected %d sockets!", numWorkers)
+
+	manifestJSON, _ := json.Marshal(map[string]interface{}{
+		"type":         "manifest",
+		"file_id":      pipe.FileIDHex,
+		"file_name":    pipe.FileName,
+		"file_size":    pipe.FileSize,
+		"total_chunks": pipe.TotalChunks,
+		"chunk_size":   pipe.ChunkSize,
+		"compressed":   opts.Compress,
+		"encrypted":    opts.Encrypt,
+	})
+	
+	lenBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lenBuf, uint32(len(manifestJSON)+1))
+	conns[0].Write(lenBuf)
+	conns[0].Write([]byte{0})
+	conns[0].Write(manifestJSON)
+
+	time.Sleep(100 * time.Millisecond)
+
+	log.Printf("[P2P-TCP] Manifest sent (%d chunks)", pipe.TotalChunks)
+
+	totalChunks := pipe.TotalChunks
+	jobs := make(chan chunker.ChunkResult)
+	results := make(chan UploadResult, totalChunks)
+
+	bar := progressbar.NewOptions(totalChunks,
+		progressbar.OptionSetDescription("  ⚡ P2P TCP Upload"),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer: "█", SaucerHead: "▓", SaucerPadding: "░",
+			BarStart: "│", BarEnd: "│",
+		}),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionClearOnFinish(),
+		progressbar.OptionOnCompletion(func() { fmt.Println() }),
+	)
+
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int, c net.Conn) {
+			defer wg.Done()
+			defer c.Close()
+			for cr := range jobs {
+				res := p2pUploadChunkTCP(c, cr, pipe.FileIDHex, opts)
+				results <- res
+			}
+		}(w, conns[w])
+	}
+
+	var pipeErr error
+	go func() {
+		for cr := range pipe.ChunkCh {
+			if cr.Err != nil {
+				pipeErr = cr.Err
+				break
+			}
+			jobs <- cr
+		}
+		close(jobs)
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	stats := &TransferStats{TotalChunks: totalChunks}
+	for res := range results {
+		if res.Success {
+			stats.SuccessCount++
+			stats.TotalBytes += int64(res.BytesSent)
+		} else {
+			stats.FailCount++
+		}
+		_ = bar.Add(1)
+	}
+
+	if pipeErr != nil {
+		return stats, fmt.Errorf("pipeline: %w", pipeErr)
+	}
+	return stats, nil
+}
+
+func p2pUploadChunkTCP(conn net.Conn, cr chunker.ChunkResult, fileID string, opts *TransferOptions) UploadResult {
+	start := time.Now()
+	result := UploadResult{ChunkID: cr.Chunk.ID}
+
+	defer func() {
+		if cr.BufferPtr != nil {
+			chunker.ChunkPool.Put(cr.BufferPtr)
+		}
+	}()
+
+	var data []byte
+	if cr.Data != nil {
+		data = cr.Data
+	} else if cr.ChunkPath != "" {
+		var err error
+		data, err = os.ReadFile(cr.ChunkPath)
+		if err != nil {
+			result.Err = err
+			return result
+		}
+	}
+
+	if opts.Compress {
+		if transformed, ok := aecrypto.CompressLZ4(data); ok {
+			data = transformed
+		}
+	}
+	if opts.Encrypt {
+		enc, err := aecrypto.Encrypt(data, opts.EncryptKey)
+		if err != nil {
+			result.Err = err
+			return result
+		}
+		data = enc
+	}
+
+	hash := sha256.Sum256(data)
+
+	frame := &bytes.Buffer{}
+	frame.WriteByte(1)
+	frame.WriteByte(byte(len(fileID)))
+	frame.WriteString(fileID)
+	binary.Write(frame, binary.BigEndian, cr.Chunk.ID)
+	frame.Write(hash[:])
+	frame.Write(data)
+
+	frameBytes := frame.Bytes()
+	lengthPrefix := make([]byte, 4)
+	binary.BigEndian.PutUint32(lengthPrefix, uint32(len(frameBytes)))
+
+	if _, err := conn.Write(lengthPrefix); err != nil {
+		result.Err = fmt.Errorf("write length prefix: %w", err)
+		return result
+	}
+	if _, err := conn.Write(frameBytes); err != nil {
+		result.Err = fmt.Errorf("write chunk: %w", err)
+		return result
+	}
+
+	ack := make([]byte, 1)
+	if _, err := io.ReadFull(conn, ack); err != nil {
+		result.Err = fmt.Errorf("wait ack: %w", err)
+		return result
+	}
+
+	result.Success = true
+	result.BytesSent = uint32(len(data))
+	result.Duration = time.Since(start)
+	return result
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// ListenDirectTCP — receive chunks directly over TCP
+// ──────────────────────────────────────────────────────────────────────
+
+func ListenDirectTCP(expectedFileID string, outputDir string, opts *TransferOptions) (*RelayManifest, *DownloadStats, error) {
+	if opts == nil {
+		opts = &TransferOptions{}
+	}
+
+	listenAddr := fmt.Sprintf("0.0.0.0:%d", DirectTCPPort)
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("tcp listen %s: %w", listenAddr, err)
+	}
+	defer listener.Close()
+
+	log.Printf("[P2P-TCP] Listening on %s ...", listenAddr)
+
+	conn0, err := listener.Accept()
+	if err != nil {
+		return nil, nil, fmt.Errorf("accept conn0: %w", err)
+	}
+
+	lenBuf := make([]byte, 4)
+	if _, err := io.ReadFull(conn0, lenBuf); err != nil {
+		return nil, nil, fmt.Errorf("read manifest len: %w", err)
+	}
+	frameLen := binary.BigEndian.Uint32(lenBuf)
+
+	allData := make([]byte, frameLen)
+	if _, err := io.ReadFull(conn0, allData); err != nil {
+		return nil, nil, fmt.Errorf("read manifest data: %w", err)
+	}
+
+	if allData[0] != 0 {
+		return nil, nil, fmt.Errorf("invalid manifest opcode")
+	}
+	manifestData := allData[1:]
+
+	var manifest RelayManifest
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		return nil, nil, fmt.Errorf("decode manifest: %w", err)
+	}
+
+	if expectedFileID != "" && manifest.FileID != expectedFileID {
+		log.Printf("[P2P-TCP] File ID mismatch: requested %s, got %s", expectedFileID, manifest.FileID)
+	}
+
+	opts.Compress = manifest.Compressed
+	opts.Encrypt = manifest.Encrypted && opts.Encrypt
+
+	finalPath := filepath.Join(outputDir, manifest.FileName)
+	f, err := os.OpenFile(finalPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create output file: %w", err)
+	}
+	defer f.Close()
+
+	if err := f.Truncate(manifest.FileSize); err != nil {
+		return nil, nil, fmt.Errorf("truncate file: %w", err)
+	}
+
+	mmapData, err := syscall.Mmap(int(f.Fd()), 0, int(manifest.FileSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		return nil, nil, fmt.Errorf("mmap file: %w", err)
+	}
+	defer syscall.Munmap(mmapData)
+
+	totalChunks := manifest.TotalChunks
+	log.Printf("[P2P-TCP] Receiving %d chunks for file %s (mmap)", totalChunks, manifest.FileName)
+
+	bar := progressbar.NewOptions(totalChunks,
+		progressbar.OptionSetDescription("  ⚡ P2P TCP Download"),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer: "█", SaucerHead: "▓", SaucerPadding: "░",
+			BarStart: "│", BarEnd: "│",
+		}),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionClearOnFinish(),
+		progressbar.OptionOnCompletion(func() { fmt.Println() }),
+	)
+
+	stats := &DownloadStats{TotalChunks: totalChunks}
+	var chunkWg sync.WaitGroup
+	var statsMu sync.Mutex
+
+	chunkWg.Add(totalChunks)
+
+	go handleTCPStream(conn0, mmapData, manifest.ChunkSize, opts, bar, stats, &statsMu, &chunkWg)
+
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				break
+			}
+			go handleTCPStream(c, mmapData, manifest.ChunkSize, opts, bar, stats, &statsMu, &chunkWg)
+		}
+	}()
+
+	chunkWg.Wait()
+	return &manifest, stats, nil
+}
+
+func handleTCPStream(conn net.Conn, mmapData []byte, chunkSize uint32, opts *TransferOptions, bar *progressbar.ProgressBar, stats *DownloadStats, statsMu *sync.Mutex, chunkWg *sync.WaitGroup) {
+	defer conn.Close()
+	for {
+		res := p2pReceiveChunkTCP(conn, mmapData, chunkSize, opts)
+		if res.EOF { return }
+
+		statsMu.Lock()
+		if res.Success {
+			stats.SuccessCount++
+			stats.TotalBytes += res.BytesRecv
+		} else {
+			stats.FailCount++
+			log.Printf("[P2P-TCP] chunk %d failed: %v", res.ChunkID, res.Err)
+		}
+		_ = bar.Add(1)
+		statsMu.Unlock()
+		chunkWg.Done()
+	}
+}
+
+func p2pReceiveChunkTCP(conn net.Conn, mmapData []byte, chunkSize uint32, opts *TransferOptions) DownloadResult {
+	start := time.Now()
+	result := DownloadResult{}
+
+	lenBuf := make([]byte, 4)
+	n, err := io.ReadFull(conn, lenBuf)
+	if err != nil {
+		if err == io.EOF && n == 0 {
+			result.EOF = true
+			return result
+		}
+		result.Err = fmt.Errorf("read frame len: %w", err)
+		return result
+	}
+	frameLen := binary.BigEndian.Uint32(lenBuf)
+
+	bufPtr := chunker.ChunkPool.Get().(*[]byte)
+	defer chunker.ChunkPool.Put(bufPtr)
+	
+	buf := (*bufPtr)[:frameLen]
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		result.Err = fmt.Errorf("read stream: %w", err)
+		return result
+	}
+	allData := buf
+
+	if len(allData) < 39 { 
+		result.Err = fmt.Errorf("frame too short (%d bytes)", len(allData))
+		return result
+	}
+
+	pos := 0
+	_ = allData[pos] // opcode = 1
+	pos++
+	fidLen := int(allData[pos])
+	pos++
+	_ = string(allData[pos : pos+fidLen]) // fileID
+	pos += fidLen
+
+	chunkID := binary.BigEndian.Uint32(allData[pos : pos+4])
+	pos += 4
+	expectedHash := allData[pos : pos+32]
+	pos += 32
+	data := allData[pos:]
+
+	result.ChunkID = int(chunkID)
+
+	computedHash := sha256.Sum256(data)
+	if !bytes.Equal(computedHash[:], expectedHash) {
+		result.Err = fmt.Errorf("hash mismatch on chunk %d", chunkID)
+		conn.Write([]byte{0}) // NACK
+		return result
+	}
+
+	if opts.Encrypt {
+		dec, err := aecrypto.Decrypt(data, opts.EncryptKey)
+		if err != nil {
+			result.Err = err
+			return result
+		}
+		data = dec
+	}
+	if opts.Compress {
+		dec, err := aecrypto.DecompressLZ4(data)
+		if err != nil {
+			result.Err = err
+			return result
+		}
+		data = dec
+	}
+
+	offset := int64(chunkID) * int64(chunkSize)
+	copy(mmapData[offset:offset+int64(len(data))], data)
+
+	conn.Write([]byte{1})
 
 	result.Success = true
 	result.BytesRecv = int64(len(data))
