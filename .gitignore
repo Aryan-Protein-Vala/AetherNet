@@ -31,3 +31,6 @@ aether_100mb_test.bin
 .aether_received/
 .aether_cache/
 bin/
+*.bin
+.aether_cache/
+.aether_received/

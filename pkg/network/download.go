@@ -19,6 +19,7 @@ import (
 
 // RelayManifest is the JSON structure returned by GET /manifest.
 type RelayManifest struct {
+	FileID      string `json:"file_id"`
 	FileName    string `json:"file_name"`
 	FileSize    int64  `json:"file_size"`
 	TotalChunks int    `json:"total_chunks"`

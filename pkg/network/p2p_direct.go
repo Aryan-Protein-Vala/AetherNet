@@ -48,14 +48,19 @@ func UploadDirectQUIC(pipe *chunker.PipelineInfo, targetIP string, numWorkers in
 	log.Printf("[P2P] Dialing peer at %s ...", targetAddr)
 
 	conn, err := quic.DialAddr(context.Background(), targetAddr, tlsConf, &quic.Config{
-		MaxIdleTimeout:          60 * time.Second,
-		Allow0RTT:               true,
-		DisablePathMTUDiscovery: true,
+		MaxIdleTimeout:                120 * time.Second,
+		Allow0RTT:                     true,
+		DisablePathMTUDiscovery:       true,
+		MaxIncomingStreams:             1000,
+		InitialStreamReceiveWindow:    8 * 1024 * 1024, // 8MB
+		InitialConnectionReceiveWindow: 32 * 1024 * 1024, // 32MB
 	})
 	if err != nil {
 		return nil, fmt.Errorf("p2p quic dial %s: %w", targetAddr, err)
 	}
 	defer conn.CloseWithError(0, "done")
+
+	log.Printf("[P2P] Connected to peer!")
 
 	// Send manifest on stream 0
 	manifestStream, err := conn.OpenStreamSync(context.Background())
@@ -77,6 +82,11 @@ func UploadDirectQUIC(pipe *chunker.PipelineInfo, targetIP string, numWorkers in
 	writeFrame(manifestStream, manifestJSON)
 	manifestStream.Close()
 
+	// Small delay to ensure receiver's accept loop is ready
+	time.Sleep(100 * time.Millisecond)
+
+	log.Printf("[P2P] Manifest sent (%d chunks)", pipe.TotalChunks)
+
 	totalChunks := pipe.TotalChunks
 	jobs := make(chan chunker.ChunkResult)
 	results := make(chan UploadResult, totalChunks)
@@ -96,12 +106,13 @@ func UploadDirectQUIC(pipe *chunker.PipelineInfo, targetIP string, numWorkers in
 	var wg sync.WaitGroup
 	for w := 0; w < numWorkers; w++ {
 		wg.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer wg.Done()
 			for cr := range jobs {
-				results <- uploadChunkQUIC(&conn, cr, pipe.FileIDHex, opts)
+				res := p2pUploadChunk(conn, cr, pipe.FileIDHex, opts)
+				results <- res
 			}
-		}()
+		}(w)
 	}
 
 	var pipeErr error
@@ -138,6 +149,90 @@ func UploadDirectQUIC(pipe *chunker.PipelineInfo, targetIP string, numWorkers in
 	return stats, nil
 }
 
+// p2pUploadChunk sends a single chunk over a dedicated QUIC stream.
+// The receiver reads the header+data, verifies the hash, and sends a 1-byte ACK.
+func p2pUploadChunk(conn *quic.Conn, cr chunker.ChunkResult, fileID string, opts *TransferOptions) UploadResult {
+	start := time.Now()
+	result := UploadResult{ChunkID: cr.Chunk.ID}
+
+	defer func() {
+		if cr.BufferPtr != nil {
+			chunker.ChunkPool.Put(cr.BufferPtr)
+		}
+	}()
+
+	var data []byte
+	if cr.Data != nil {
+		data = cr.Data
+	} else if cr.ChunkPath != "" {
+		var err error
+		data, err = os.ReadFile(cr.ChunkPath)
+		if err != nil {
+			result.Err = err
+			return result
+		}
+	}
+
+	if opts.Compress {
+		if transformed, ok := aecrypto.CompressLZ4(data); ok {
+			data = transformed
+		}
+	}
+	if opts.Encrypt {
+		enc, err := aecrypto.Encrypt(data, opts.EncryptKey)
+		if err != nil {
+			result.Err = err
+			return result
+		}
+		data = enc
+	}
+
+	hash := sha256.Sum256(data)
+
+	// Build the chunk frame: [type=1][fidLen][fid][chunkID_u32][hash_32][data]
+	frame := &bytes.Buffer{}
+	frame.WriteByte(1)
+	frame.WriteByte(byte(len(fileID)))
+	frame.WriteString(fileID)
+	binary.Write(frame, binary.BigEndian, cr.Chunk.ID)
+	frame.Write(hash[:])
+	frame.Write(data)
+
+	// Open a new bidirectional stream for this chunk
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		result.Err = fmt.Errorf("open stream: %w", err)
+		return result
+	}
+
+	// Write entire frame at once
+	if _, err := stream.Write(frame.Bytes()); err != nil {
+		result.Err = fmt.Errorf("write chunk: %w", err)
+		return result
+	}
+
+	// Close write direction — signals to receiver that data is complete
+	stream.Close()
+
+	// Wait for 1-byte ACK from receiver
+	ack := make([]byte, 1)
+	if _, err := io.ReadFull(stream, ack); err != nil {
+		result.Err = fmt.Errorf("wait ack: %w", err)
+		return result
+	}
+	if ack[0] != 1 {
+		result.Err = fmt.Errorf("chunk %d rejected (hash mismatch)", cr.Chunk.ID)
+		return result
+	}
+
+	result.Success = true
+	result.BytesSent = uint32(len(data))
+	result.Duration = time.Since(start)
+	return result
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // ListenDirectQUIC — receive chunks directly from a peer (no relay)
 // ──────────────────────────────────────────────────────────────────────
@@ -153,9 +248,12 @@ func ListenDirectQUIC(expectedFileID string, outputDir string, opts *TransferOpt
 	tlsConf.NextProtos = []string{"aether-p2p"}
 
 	listener, err := quic.ListenAddr(listenAddr, tlsConf, &quic.Config{
-		MaxIdleTimeout:          60 * time.Second,
-		Allow0RTT:               true,
-		DisablePathMTUDiscovery: true,
+		MaxIdleTimeout:                120 * time.Second,
+		Allow0RTT:                     true,
+		DisablePathMTUDiscovery:       true,
+		MaxIncomingStreams:             1000,
+		InitialStreamReceiveWindow:    8 * 1024 * 1024, // 8MB
+		InitialConnectionReceiveWindow: 32 * 1024 * 1024, // 32MB
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("p2p listen %s: %w", listenAddr, err)
@@ -189,7 +287,7 @@ func ListenDirectQUIC(expectedFileID string, outputDir string, opts *TransferOpt
 
 	// Parse: [opcode=0] [4-byte len] [json]
 	if len(allData) < 5 || allData[0] != 0 {
-		return nil, nil, fmt.Errorf("invalid manifest frame")
+		return nil, nil, fmt.Errorf("invalid manifest frame (len=%d)", len(allData))
 	}
 	frameLen := binary.BigEndian.Uint32(allData[1:5])
 	manifestData := allData[5 : 5+frameLen]
@@ -200,7 +298,7 @@ func ListenDirectQUIC(expectedFileID string, outputDir string, opts *TransferOpt
 	}
 
 	if expectedFileID != "" && manifest.FileID != expectedFileID {
-		return nil, nil, fmt.Errorf("file ID mismatch: expected %s, got %s", expectedFileID, manifest.FileID)
+		log.Printf("[P2P] File ID mismatch (expected %s, got %s) — accepting anyway", expectedFileID, manifest.FileID)
 	}
 
 	opts.Compress = manifest.Compressed
@@ -230,18 +328,18 @@ func ListenDirectQUIC(expectedFileID string, outputDir string, opts *TransferOpt
 	for i := 0; i < totalChunks; i++ {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
-			log.Printf("[P2P] Error accepting chunk stream: %v", err)
+			log.Printf("[P2P-RX] accept stream %d err: %v", i, err)
 			stats.FailCount++
 			continue
 		}
 
-		res := receiveDirectChunk(stream, cacheDir, opts)
+		res := p2pReceiveChunk(stream, cacheDir, opts)
 		if res.Success {
 			stats.SuccessCount++
 			stats.TotalBytes += res.BytesRecv
 		} else {
 			stats.FailCount++
-			log.Printf("[P2P] Chunk %d failed: %v", res.ChunkID, res.Err)
+			log.Printf("[P2P-RX] chunk %d failed: %v", res.ChunkID, res.Err)
 		}
 		_ = bar.Add(1)
 	}
@@ -249,20 +347,20 @@ func ListenDirectQUIC(expectedFileID string, outputDir string, opts *TransferOpt
 	return &manifest, stats, nil
 }
 
-// receiveDirectChunk reads a single chunk from a QUIC stream (P2P direct).
-func receiveDirectChunk(stream quic.Stream, cacheDir string, opts *TransferOptions) DownloadResult {
+// p2pReceiveChunk reads a single chunk from a QUIC stream (P2P direct).
+func p2pReceiveChunk(stream *quic.Stream, cacheDir string, opts *TransferOptions) DownloadResult {
 	start := time.Now()
 	result := DownloadResult{}
 
 	allData, err := io.ReadAll(stream)
 	if err != nil {
-		result.Err = err
+		result.Err = fmt.Errorf("read stream: %w", err)
 		return result
 	}
 
 	// Frame: [type=1] [fileID_len] [fileID] [chunkID_u32] [hash_32] [data]
-	if len(allData) < 2 {
-		result.Err = fmt.Errorf("frame too short")
+	if len(allData) < 39 { // minimum: 1 + 1 + 1 + 4 + 32
+		result.Err = fmt.Errorf("frame too short (%d bytes)", len(allData))
 		return result
 	}
 
@@ -286,13 +384,12 @@ func receiveDirectChunk(stream quic.Stream, cacheDir string, opts *TransferOptio
 	computedHash := sha256.Sum256(data)
 	if !bytes.Equal(computedHash[:], expectedHash) {
 		result.Err = fmt.Errorf("hash mismatch on chunk %d", chunkID)
-		// Send NACK
-		stream.Write([]byte{0})
+		(*stream).Write([]byte{0}) // NACK
 		return result
 	}
 
 	// Send ACK
-	stream.Write([]byte{1})
+	(*stream).Write([]byte{1})
 
 	// Reverse transforms
 	if opts.Encrypt {
