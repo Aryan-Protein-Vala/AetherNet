@@ -46,17 +46,22 @@ var (
 type Server struct {
 	Port int
 	mux  *http.ServeMux
+	hub  *SignalingHub
 }
 
 // New creates a new relay Server.
 func New(port int) *Server {
-	s := &Server{Port: port}
+	s := &Server{
+		Port: port,
+		hub:  NewSignalingHub(),
+	}
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("/upload", s.handleUpload)
 	s.mux.HandleFunc("/manifest", s.handleManifest)
 	s.mux.HandleFunc("/chunk", s.handleGetChunk)
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/download-cli", s.handleDownloadCLI)
+	s.mux.HandleFunc("/ws", s.hub.HandleWS)
 	return s
 }
 

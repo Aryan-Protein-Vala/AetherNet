@@ -4,6 +4,8 @@ go 1.26.1
 
 require (
 	github.com/fatih/color v1.18.0
+	github.com/google/uuid v1.6.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/pierrec/lz4/v4 v4.1.26
 	github.com/quic-go/quic-go v0.59.0
 	github.com/schollz/progressbar/v3 v3.19.0

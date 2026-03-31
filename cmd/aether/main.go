@@ -71,6 +71,7 @@ func main() {
 	sendCmd.Flags().BoolP("encrypt", "e", false, "Enable AES-256-GCM encryption")
 	sendCmd.Flags().StringP("password", "k", "", "Encryption passphrase")
 	sendCmd.Flags().Bool("quic", false, "Use QUIC transport (UDP, zero HOL blocking)")
+	sendCmd.Flags().Bool("p2p-listen", false, "Connect to relay P2P signaling hub")
 	root.AddCommand(sendCmd)
 
 	// ── fetch ─────────────────────────────────────────────────────────
@@ -85,6 +86,7 @@ func main() {
 	fetchCmd.Flags().IntP("workers", "w", 5, "Parallel download workers")
 	fetchCmd.Flags().StringP("password", "k", "", "Decryption passphrase")
 	fetchCmd.Flags().Bool("quic", false, "Use QUIC transport")
+	fetchCmd.Flags().Bool("p2p-listen", false, "Connect to relay P2P signaling hub")
 	root.AddCommand(fetchCmd)
 
 	// ── relay ─────────────────────────────────────────────────────────
@@ -157,6 +159,22 @@ func runSend(cmd *cobra.Command, args []string) error {
 	printKV("Transport", transport)
 	printKV("Mode", "mmap + parallel")
 	fmt.Println()
+
+	p2pListen, _ := cmd.Flags().GetBool("p2p-listen")
+	if p2pListen {
+		sigClient, err := network.ConnectSignaling(targetURL)
+		if err != nil {
+			printError("P2P Signaling connection failed: %v", err)
+		} else {
+			printSuccess("Connected to P2P Signaling Hub as %s", sigClient.ClientID)
+			go func() {
+				for msg := range sigClient.MsgCh {
+					fmt.Printf("\n[P2P] Incoming message from %s (Type: %s) -> %s\n", msg.ClientID, msg.Type, msg.Payload)
+				}
+			}()
+			defer sigClient.Close()
+		}
+	}
 
 	printStep("Chunking + uploading (mmap pipelined)")
 	totalStart := time.Now()
@@ -275,6 +293,22 @@ func runFetch(cmd *cobra.Command, args []string) error {
 	}
 	printKV("Output", outputDir)
 	fmt.Println()
+
+	p2pListen, _ := cmd.Flags().GetBool("p2p-listen")
+	if p2pListen {
+		sigClient, err := network.ConnectSignaling(relayURL)
+		if err != nil {
+			printError("P2P Signaling connection failed: %v", err)
+		} else {
+			printSuccess("Connected to P2P Signaling Hub as %s", sigClient.ClientID)
+			go func() {
+				for msg := range sigClient.MsgCh {
+					fmt.Printf("\n[P2P] Incoming message from %s (Type: %s) -> %s\n", msg.ClientID, msg.Type, msg.Payload)
+				}
+			}()
+			defer sigClient.Close()
+		}
+	}
 
 	// ── Fetch manifest ───────────────────────────────────────────────
 	printStep("Fetching manifest...")
