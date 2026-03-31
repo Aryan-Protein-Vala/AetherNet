@@ -6,8 +6,15 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
+)
+
+const (
+	pingInterval = 30 * time.Second
+	pongWait     = 45 * time.Second // Must be > pingInterval
+	writeWait    = 10 * time.Second
 )
 
 var wsupgrader = websocket.Upgrader{
@@ -18,12 +25,14 @@ var wsupgrader = websocket.Upgrader{
 
 // SignalingMessage defines the structure of JSON payloads sent over the WS.
 type SignalingMessage struct {
-	Type     string `json:"type"`                // "register", "offer", "answer", "ice", "match"
+	Type     string `json:"type"`                // "register", "connect_request", "connect_accept", "error"
 	ClientID string `json:"client_id"`           // The sender's ID
 	TargetID string `json:"target_id,omitempty"` // The intended recipient
 	LocalIP  string `json:"local_ip,omitempty"`
 	PublicIP string `json:"public_ip,omitempty"`
-	Payload  string `json:"payload,omitempty"`   // Generic data payload (SDP, SDP, IP/Port hints)
+	FileID   string `json:"file_id,omitempty"`   // File ID for direct transfers
+	FileName string `json:"file_name,omitempty"` // Original filename
+	Payload  string `json:"payload,omitempty"`   // Generic data payload
 }
 
 // SignalingHub tracks connected P2P clients and routes messages between them.
@@ -49,8 +58,19 @@ func (h *SignalingHub) HandleWS(w http.ResponseWriter, r *http.Request) {
 
 	var clientID string
 
+	// Set initial read deadline; refreshed on every pong
+	conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
+	// Start ping ticker to keep the connection alive through load balancers
+	pingTicker := time.NewTicker(pingInterval)
+
 	// Clean up on disconnect
 	defer func() {
+		pingTicker.Stop()
 		if clientID != "" {
 			h.mu.Lock()
 			delete(h.clients, clientID)
@@ -58,6 +78,16 @@ func (h *SignalingHub) HandleWS(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[P2P Disconnected] %s", clientID)
 		}
 		conn.Close()
+	}()
+
+	// Ping goroutine — sends periodic pings to detect dead connections
+	go func() {
+		for range pingTicker.C {
+			conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return // Connection dead
+			}
+		}
 	}()
 
 	for {
@@ -81,24 +111,39 @@ func (h *SignalingHub) HandleWS(w http.ResponseWriter, r *http.Request) {
 
 			log.Printf("[P2P Registered] %s (Local: %s)", clientID, msg.LocalIP)
 
+			// Send back an ack with the list of online peers (excluding self)
+			h.mu.RLock()
+			peers := make([]string, 0, len(h.clients))
+			for id := range h.clients {
+				if id != clientID {
+					peers = append(peers, id)
+				}
+			}
+			h.mu.RUnlock()
+
+			peersJSON, _ := json.Marshal(peers)
+			conn.WriteJSON(SignalingMessage{
+				Type:    "registered",
+				Payload: string(peersJSON),
+			})
+
 		default:
-			// For non-register messages, we just forward them to the target
+			// For all other messages (connect_request, connect_accept, etc.),
+			// forward them directly to the target client
 			if msg.TargetID != "" {
 				h.mu.RLock()
 				targetConn, exists := h.clients[msg.TargetID]
 				h.mu.RUnlock()
 
 				if exists {
-					// Forward the raw JSON so target processes it
 					if err := targetConn.WriteMessage(websocket.TextMessage, msgBytes); err != nil {
 						log.Printf("[P2P Forward Error] -> %s: %v", msg.TargetID, err)
 					}
 				} else {
-					// Target not found, notify sender
 					errResp := SignalingMessage{
 						Type:     "error",
 						TargetID: msg.ClientID,
-						Payload:  fmt.Sprintf("target %s not found", msg.TargetID),
+						Payload:  fmt.Sprintf("target %s not found or offline", msg.TargetID),
 					}
 					conn.WriteJSON(errResp)
 				}

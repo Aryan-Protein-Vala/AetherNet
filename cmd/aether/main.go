@@ -8,6 +8,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -72,6 +73,7 @@ func main() {
 	sendCmd.Flags().StringP("password", "k", "", "Encryption passphrase")
 	sendCmd.Flags().Bool("quic", false, "Use QUIC transport (UDP, zero HOL blocking)")
 	sendCmd.Flags().Bool("p2p-listen", false, "Connect to relay P2P signaling hub")
+	sendCmd.Flags().String("to-peer", "", "Direct P2P send to a peer's ClientID (bypasses relay)")
 	root.AddCommand(sendCmd)
 
 	// ── fetch ─────────────────────────────────────────────────────────
@@ -159,6 +161,57 @@ func runSend(cmd *cobra.Command, args []string) error {
 	printKV("Transport", transport)
 	printKV("Mode", "mmap + parallel")
 	fmt.Println()
+
+	// ── P2P Direct Send Mode ─────────────────────────────────────────
+	toPeer, _ := cmd.Flags().GetString("to-peer")
+	if toPeer != "" {
+		printStep("Connecting to P2P Signaling Hub...")
+		sigClient, err := network.ConnectSignaling(targetURL)
+		if err != nil {
+			printError("P2P Signaling failed: %v", err)
+			return err
+		}
+		defer sigClient.Close()
+		printSuccess("Registered as %s", sigClient.ClientID)
+
+		// Chunk the file first to get the file ID
+		printStep("Chunking file...")
+		totalStart := time.Now()
+		pipe, err := chunker.ChunkFileFast(absPath, 0)
+		if err != nil {
+			printError("Pipeline init failed: %v", err)
+			return err
+		}
+		printSuccess("Pipeline started: %d chunks (%s each)", pipe.TotalChunks, formatBytes(int64(pipe.ChunkSize)))
+
+		printStep(fmt.Sprintf("Requesting P2P connection to peer %s...", toPeer))
+		acceptMsg, err := sigClient.RequestPeerConnection(toPeer, pipe.FileIDHex, pipe.FileName)
+		if err != nil {
+			printError("P2P handshake failed: %v", err)
+			return err
+		}
+		printSuccess("Peer accepted! Direct IP: %s", acceptMsg.LocalIP)
+
+		printStep(fmt.Sprintf("Uploading directly to %s via QUIC P2P...", acceptMsg.LocalIP))
+		stats, err := network.UploadDirectQUIC(pipe, acceptMsg.LocalIP, workers, opts)
+		if err != nil {
+			printError("P2P transfer failed: %v", err)
+			return err
+		}
+
+		totalDur := time.Since(totalStart)
+		fmt.Println()
+		printDivider()
+		fmt.Println()
+		fmt.Printf("  %s P2P Direct Transfer complete\n\n", greenC("✓"))
+		mbPerSec := float64(stats.TotalBytes) / (1024 * 1024) / totalDur.Seconds()
+		printKV("Chunks", fmt.Sprintf("%d/%d %s", stats.SuccessCount, stats.TotalChunks, dimC("verified")))
+		printKV("Transferred", formatBytes(stats.TotalBytes))
+		printKV("Total Time", boldC(formatDuration(totalDur)))
+		printKV("Throughput", fmt.Sprintf("%s %s", magC(fmt.Sprintf("%.2f MB/s", mbPerSec)), dimC("(avg)")))
+		fmt.Println()
+		return nil
+	}
 
 	p2pListen, _ := cmd.Flags().GetBool("p2p-listen")
 	if p2pListen {
@@ -296,17 +349,69 @@ func runFetch(cmd *cobra.Command, args []string) error {
 
 	p2pListen, _ := cmd.Flags().GetBool("p2p-listen")
 	if p2pListen {
-		sigClient, err := network.ConnectSignaling(relayURL)
-		if err != nil {
-			printError("P2P Signaling connection failed: %v", err)
+		sigClient, sigErr := network.ConnectSignaling(relayURL)
+		if sigErr != nil {
+			printError("P2P Signaling connection failed: %v", sigErr)
 		} else {
-			printSuccess("Connected to P2P Signaling Hub as %s", sigClient.ClientID)
+			printSuccess("Connected to P2P Hub as %s — waiting for direct transfers...", sigClient.ClientID)
+
+			// Listen for incoming connect_request messages and auto-accept
 			go func() {
 				for msg := range sigClient.MsgCh {
-					fmt.Printf("\n[P2P] Incoming message from %s (Type: %s) -> %s\n", msg.ClientID, msg.Type, msg.Payload)
+					switch msg.Type {
+					case "connect_request":
+						fmt.Printf("\n  %s Incoming P2P transfer from %s (File: %s)\n",
+							cyanC("⚡"), msg.ClientID, msg.FileName)
+						fmt.Printf("  %s Peer IP: %s\n", dimC("→"), msg.LocalIP)
+
+						// Accept the connection
+						if err := sigClient.AcceptPeerConnection(msg.ClientID); err != nil {
+							printError("Failed to accept P2P: %v", err)
+							continue
+						}
+						printSuccess("Accepted! Launching direct QUIC listener...")
+
+						// Launch direct QUIC listener in a goroutine
+						go func(incomingFileID, incomingFileName string) {
+							manifest, dlStats, err := network.ListenDirectQUIC(incomingFileID, outputDir, opts)
+							if err != nil {
+								printError("P2P receive failed: %v", err)
+								return
+							}
+
+							// Write manifest.json so ReassembleFromCache can resolve filename
+							cacheDir := filepath.Join(".aether_cache", manifest.FileID)
+							manifestJSON, _ := json.Marshal(manifest)
+							os.WriteFile(filepath.Join(cacheDir, "manifest.json"), manifestJSON, 0o644)
+
+							outPath, reassembleErr := receiver.ReassembleFromCache(manifest.FileID, outputDir)
+							if reassembleErr != nil {
+								printError("Reassemble failed: %v", reassembleErr)
+								return
+							}
+
+							fmt.Println()
+							printDivider()
+							fmt.Printf("\n  %s P2P Direct Download complete\n\n", greenC("✓"))
+							printKV("Chunks", fmt.Sprintf("%d/%d %s", dlStats.SuccessCount, dlStats.TotalChunks, dimC("verified")))
+							printKV("Downloaded", formatBytes(dlStats.TotalBytes))
+							printKV("Output", boldC(outPath))
+							fmt.Println()
+						}(msg.FileID, msg.FileName)
+
+					case "registered":
+						fmt.Printf("  %s Online peers: %s\n", dimC("→"), msg.Payload)
+
+					default:
+						fmt.Printf("\n[P2P] %s from %s: %s\n", msg.Type, msg.ClientID, msg.Payload)
+					}
 				}
 			}()
 			defer sigClient.Close()
+
+			// Block here — wait for P2P transfers instead of doing relay fetch
+			printStep("Waiting for incoming P2P transfers... (Ctrl+C to exit)")
+			select {} // Block forever until killed
 		}
 	}
 
