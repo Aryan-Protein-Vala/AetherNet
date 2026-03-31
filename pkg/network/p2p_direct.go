@@ -445,9 +445,6 @@ func p2pReceiveChunk(stream *quic.Stream, mmapData []byte, chunkSize uint32, opt
 		return result
 	}
 
-	// Send ACK
-	(*stream).Write([]byte{1})
-
 	// Reverse transforms
 	if opts.Encrypt {
 		dec, err := aecrypto.Decrypt(data, opts.EncryptKey)
