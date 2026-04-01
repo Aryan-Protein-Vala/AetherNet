@@ -405,68 +405,87 @@ func p2pReceiveChunk(stream *quic.Stream, mmapData []byte, chunkSize uint32, opt
 	}
 	frameLen := binary.BigEndian.Uint32(lenBuf)
 
-	// Grab memory from pool to avoid Garbage Collection panics
-	bufPtr := chunker.ChunkPool.Get().(*[]byte)
-	defer chunker.ChunkPool.Put(bufPtr)
-	
-	// Read directly into the pre-allocated pool buffer
-	buf := (*bufPtr)[:frameLen]
-	if _, err := io.ReadFull(stream, buf); err != nil {
-		result.Err = fmt.Errorf("read stream: %w", err)
+	// 2. Read small header prefix (Opcode + fidLen)
+	prefix := make([]byte, 2)
+	if _, err := io.ReadFull(stream, prefix); err != nil {
+		result.Err = fmt.Errorf("read prefix: %w", err)
 		return result
 	}
-	allData := buf
+	fidLen := int(prefix[1])
 
-	if len(allData) < 39 { 
-		result.Err = fmt.Errorf("frame too short (%d bytes)", len(allData))
+	// 3. Read the rest of the header (FID + ChunkID + Hash)
+	headerRest := make([]byte, fidLen+36)
+	if _, err := io.ReadFull(stream, headerRest); err != nil {
+		result.Err = fmt.Errorf("read header context: %w", err)
 		return result
 	}
 
-	pos := 0
-	_ = allData[pos] // opcode = 1
-	pos++
-	fidLen := int(allData[pos])
-	pos++
-	_ = string(allData[pos : pos+fidLen]) // fileID
-	pos += fidLen
-
-	chunkID := binary.BigEndian.Uint32(allData[pos : pos+4])
+	pos := fidLen // Skip FID
+	chunkID := binary.BigEndian.Uint32(headerRest[pos : pos+4])
 	pos += 4
-	expectedHash := allData[pos : pos+32]
-	pos += 32
-	data := allData[pos:]
+	expectedHash := headerRest[pos : pos+32]
 
 	result.ChunkID = int(chunkID)
 
-	// Verify hash
-	computedHash := sha256.Sum256(data)
-	if !bytes.Equal(computedHash[:], expectedHash) {
-		result.Err = fmt.Errorf("hash mismatch on chunk %d", chunkID)
-		(*stream).Write([]byte{0}) // NACK
-		return result
-	}
-
-	// Reverse transforms
-	if opts.Encrypt {
-		dec, err := aecrypto.Decrypt(data, opts.EncryptKey)
-		if err != nil {
-			result.Err = err
-			return result
-		}
-		data = dec
-	}
-	if opts.Compress {
-		dec, err := aecrypto.DecompressLZ4(data)
-		if err != nil {
-			result.Err = err
-			return result
-		}
-		data = dec
-	}
-
-	// Write directly to mmap memory (0 copy to disk!)
+	payloadLen := frameLen - uint32(2+fidLen+36)
 	offset := int64(chunkID) * int64(chunkSize)
-	copy(mmapData[offset:offset+int64(len(data))], data)
+
+	// 4. Determine Zero-Copy capability
+	needsTransform := opts.Encrypt || opts.Compress
+	var data []byte
+
+	if !needsTransform {
+		// 🔥 PURE ZERO-COPY PATH: Read directly from socket into mapped kernel file
+		data = mmapData[offset : offset+int64(payloadLen)]
+		if _, err := io.ReadFull(stream, data); err != nil {
+			result.Err = fmt.Errorf("read payload direct to mmap: %w", err)
+			return result
+		}
+
+		// Verify Hash in-place
+		computedHash := sha256.Sum256(data)
+		if !bytes.Equal(computedHash[:], expectedHash) {
+			result.Err = fmt.Errorf("hash mismatch on chunk %d", chunkID)
+			return result
+		}
+	} else {
+		// TRANSFORM PATH: Fallback to ChunkPool to prevent overwriting ciphertext during decryption
+		bufPtr := chunker.ChunkPool.Get().(*[]byte)
+		defer chunker.ChunkPool.Put(bufPtr)
+
+		buf := (*bufPtr)[:payloadLen]
+		if _, err := io.ReadFull(stream, buf); err != nil {
+			result.Err = fmt.Errorf("read payload into pool: %w", err)
+			return result
+		}
+		data = buf
+
+		computedHash := sha256.Sum256(data)
+		if !bytes.Equal(computedHash[:], expectedHash) {
+			result.Err = fmt.Errorf("hash mismatch on chunk %d", chunkID)
+			return result
+		}
+
+		if opts.Encrypt {
+			if dec, err := aecrypto.Decrypt(data, opts.EncryptKey); err == nil {
+				data = dec
+			} else {
+				result.Err = err
+				return result
+			}
+		}
+		if opts.Compress {
+			if dec, err := aecrypto.DecompressLZ4(data); err == nil {
+				data = dec
+			} else {
+				result.Err = err
+				return result
+			}
+		}
+
+		// Write directly to mmap memory
+		copy(mmapData[offset:offset+int64(len(data))], data)
+	}
 
 	// Send ACK (important: sender is waiting for it)
 	(*stream).Write([]byte{1})
@@ -800,63 +819,87 @@ func p2pReceiveChunkTCP(conn net.Conn, mmapData []byte, chunkSize uint32, opts *
 	}
 	frameLen := binary.BigEndian.Uint32(lenBuf)
 
-	bufPtr := chunker.ChunkPool.Get().(*[]byte)
-	defer chunker.ChunkPool.Put(bufPtr)
-	
-	buf := (*bufPtr)[:frameLen]
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		result.Err = fmt.Errorf("read stream: %w", err)
+	// 2. Read small header prefix (Opcode + fidLen)
+	prefix := make([]byte, 2)
+	if _, err := io.ReadFull(conn, prefix); err != nil {
+		result.Err = fmt.Errorf("read prefix: %w", err)
 		return result
 	}
-	allData := buf
+	fidLen := int(prefix[1])
 
-	if len(allData) < 39 { 
-		result.Err = fmt.Errorf("frame too short (%d bytes)", len(allData))
+	// 3. Read the rest of the header (FID + ChunkID + Hash)
+	headerRest := make([]byte, fidLen+36)
+	if _, err := io.ReadFull(conn, headerRest); err != nil {
+		result.Err = fmt.Errorf("read header context: %w", err)
 		return result
 	}
 
-	pos := 0
-	_ = allData[pos] // opcode = 1
-	pos++
-	fidLen := int(allData[pos])
-	pos++
-	_ = string(allData[pos : pos+fidLen]) // fileID
-	pos += fidLen
-
-	chunkID := binary.BigEndian.Uint32(allData[pos : pos+4])
+	pos := fidLen // Skip FID
+	chunkID := binary.BigEndian.Uint32(headerRest[pos : pos+4])
 	pos += 4
-	expectedHash := allData[pos : pos+32]
-	pos += 32
-	data := allData[pos:]
+	expectedHash := headerRest[pos : pos+32]
 
 	result.ChunkID = int(chunkID)
 
-	computedHash := sha256.Sum256(data)
-	if !bytes.Equal(computedHash[:], expectedHash) {
-		result.Err = fmt.Errorf("hash mismatch on chunk %d", chunkID)
-		conn.Write([]byte{0}) // NACK
-		return result
-	}
-
-	if opts.Encrypt {
-		dec, err := aecrypto.Decrypt(data, opts.EncryptKey)
-		if err != nil {
-			result.Err = err
-			return result
-		}
-		data = dec
-	}
-	if opts.Compress {
-		dec, err := aecrypto.DecompressLZ4(data)
-		if err != nil {
-			result.Err = err
-			return result
-		}
-		data = dec
-	}
-
+	payloadLen := frameLen - uint32(2+fidLen+36)
 	offset := int64(chunkID) * int64(chunkSize)
-	copy(mmapData[offset:offset+int64(len(data))], data)
+
+	// 4. Determine Zero-Copy capability
+	needsTransform := opts.Encrypt || opts.Compress
+	var data []byte
+
+	if !needsTransform {
+		// 🔥 PURE ZERO-COPY PATH: Read directly from socket into mapped kernel file
+		data = mmapData[offset : offset+int64(payloadLen)]
+		if _, err := io.ReadFull(conn, data); err != nil {
+			result.Err = fmt.Errorf("read payload direct to mmap: %w", err)
+			return result
+		}
+
+		// Verify Hash in-place
+		computedHash := sha256.Sum256(data)
+		if !bytes.Equal(computedHash[:], expectedHash) {
+			result.Err = fmt.Errorf("hash mismatch on chunk %d", chunkID)
+			return result
+		}
+	} else {
+		// TRANSFORM PATH: Fallback to ChunkPool to prevent overwriting ciphertext during decryption
+		bufPtr := chunker.ChunkPool.Get().(*[]byte)
+		defer chunker.ChunkPool.Put(bufPtr)
+
+		buf := (*bufPtr)[:payloadLen]
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			result.Err = fmt.Errorf("read payload into pool: %w", err)
+			return result
+		}
+		data = buf
+
+		computedHash := sha256.Sum256(data)
+		if !bytes.Equal(computedHash[:], expectedHash) {
+			result.Err = fmt.Errorf("hash mismatch on chunk %d", chunkID)
+			return result
+		}
+
+		if opts.Encrypt {
+			if dec, err := aecrypto.Decrypt(data, opts.EncryptKey); err == nil {
+				data = dec
+			} else {
+				result.Err = err
+				return result
+			}
+		}
+		if opts.Compress {
+			if dec, err := aecrypto.DecompressLZ4(data); err == nil {
+				data = dec
+			} else {
+				result.Err = err
+				return result
+			}
+		}
+
+		// Write transformed data to mmap
+		copy(mmapData[offset:offset+int64(len(data))], data)
+	}
 
 	conn.Write([]byte{1})
 
