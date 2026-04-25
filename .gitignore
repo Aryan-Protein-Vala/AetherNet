@@ -34,3 +34,8 @@ bin/
 *.bin
 .aether_cache/
 .aether_received/
+
+
+
+aether_master_plan.md
+business_analysis.md
