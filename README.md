@@ -14,7 +14,7 @@ Whether you are syncing massive uncompressed 8K video files across a local netwo
 
 ---
 
-## ✨ God-Mode Architecture & Optimizations
+## ✨ Architecture & Optimizations
 
 Aether achieves enterprise IBM Aspera-level speeds through four foundational pillars of optimization:
 
