@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -40,7 +39,7 @@ func UploadDirectQUIC(pipe *chunker.PipelineInfo, targetIP string, numWorkers in
 		numWorkers = DefaultWorkers
 	}
 
-	targetAddr := fmt.Sprintf("%s:%d", targetIP, DirectQUICPort)
+	targetAddr := net.JoinHostPort(targetIP, fmt.Sprintf("%d", DirectQUICPort))
 
 	tlsConf := PinnedTLSConfig("aether-p2p")
 
@@ -507,7 +506,7 @@ func UploadDirectTCP(pipe *chunker.PipelineInfo, targetIP string, numWorkers int
 		numWorkers = DefaultWorkers
 	}
 
-	targetAddr := fmt.Sprintf("%s:%d", targetIP, DirectTCPPort)
+	targetAddr := net.JoinHostPort(targetIP, fmt.Sprintf("%d", DirectTCPPort))
 	log.Printf("[P2P-TCP] Dialing peer at %s ...", targetAddr)
 
 	var conns []net.Conn
