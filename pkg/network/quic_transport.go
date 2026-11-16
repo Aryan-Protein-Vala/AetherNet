@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -30,10 +31,7 @@ func UploadQUIC(pipe *chunker.PipelineInfo, relayAddr string, numWorkers int, op
 		numWorkers = DefaultWorkers
 	}
 
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"aether-quic"},
-	}
+	tlsConf := PinnedTLSConfig("aether-quic")
 
 	conn, err := quic.DialAddr(context.Background(), relayAddr, tlsConf, &quic.Config{
 		MaxIdleTimeout:          30 * time.Second,
@@ -207,10 +205,7 @@ func DownloadQUIC(fileID string, relayAddr string, numWorkers int, opts *Transfe
 		numWorkers = DefaultWorkers
 	}
 
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"aether-quic"},
-	}
+	tlsConf := PinnedTLSConfig("aether-quic")
 
 	conn, err := quic.DialAddr(context.Background(), relayAddr, tlsConf, &quic.Config{
 		MaxIdleTimeout:          30 * time.Second,
@@ -367,6 +362,18 @@ func writeFrame(w io.Writer, data []byte) error {
 	}
 	_, err := w.Write(data)
 	return err
+}
+
+// PinnedTLSConfig returns a TLS client config that pins the embedded peer
+// certificate instead of disabling certificate verification.
+func PinnedTLSConfig(alpn string) *tls.Config {
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(localhostCert)
+	return &tls.Config{
+		RootCAs:    pool,
+		ServerName: "localhost",
+		NextProtos: []string{alpn},
+	}
 }
 
 // InsecureTLSConfig returns a self-signed TLS config for QUIC relay.

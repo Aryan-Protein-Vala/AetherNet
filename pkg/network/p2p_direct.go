@@ -42,10 +42,7 @@ func UploadDirectQUIC(pipe *chunker.PipelineInfo, targetIP string, numWorkers in
 
 	targetAddr := fmt.Sprintf("%s:%d", targetIP, DirectQUICPort)
 
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"aether-p2p"},
-	}
+	tlsConf := PinnedTLSConfig("aether-p2p")
 
 	log.Printf("[P2P] Dialing peer at %s ...", targetAddr)
 
